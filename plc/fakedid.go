@@ -66,7 +66,7 @@ func (fd *FakeDid) GetDocument(ctx context.Context, udid string) (*did.Document,
 	}, nil
 }
 
-func (fd *FakeDid) FlushCacheFor(did string) {
+func (fd *FakeDid) ClearCacheFor(did string) {
 	return
 }
 

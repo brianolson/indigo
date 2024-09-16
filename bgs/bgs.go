@@ -862,7 +862,7 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 	if host.ID != u.PDS && u.PDS != 0 {
 		log.Warnw("received event for repo from different pds than expected", "repo", evt.Repo, "expPds", u.PDS, "gotPds", host.Host)
 		// Flush any cached DID documents for this user
-		bgs.didr.FlushCacheFor(env.RepoCommit.Repo)
+		bgs.didr.ClearCacheFor(env.RepoCommit.Repo)
 
 		subj, err := bgs.createExternalUser(ctx, evt.Repo)
 		if err != nil {
@@ -932,7 +932,7 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 func (bgs *BGS) handleRepoHandle(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
 	log.Infow("bgs got repo handle event", "did", env.RepoHandle.Did, "handle", env.RepoHandle.Handle)
 	// Flush any cached DID documents for this user
-	bgs.didr.FlushCacheFor(env.RepoHandle.Did)
+	bgs.didr.ClearCacheFor(env.RepoHandle.Did)
 
 	// TODO: ignoring the data in the message and just going out to the DID doc
 	act, err := bgs.createExternalUser(ctx, env.RepoHandle.Did)
@@ -965,7 +965,7 @@ func (bgs *BGS) handleRepoHandle(ctx context.Context, host *models.PDS, env *eve
 func (bgs *BGS) handleRepoIdentity(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
 	log.Infow("bgs got identity event", "did", env.RepoIdentity.Did)
 	// Flush any cached DID documents for this user
-	bgs.didr.FlushCacheFor(env.RepoIdentity.Did)
+	bgs.didr.ClearCacheFor(env.RepoIdentity.Did)
 
 	// Refetch the DID doc and update our cached keys and handle etc.
 	_, err := bgs.createExternalUser(ctx, env.RepoIdentity.Did)
@@ -1003,7 +1003,7 @@ func (bgs *BGS) handleRepoAccount(ctx context.Context, host *models.PDS, env *ev
 
 	log.Infow("bgs got account event", "did", env.RepoAccount.Did)
 	// Flush any cached DID documents for this user
-	bgs.didr.FlushCacheFor(env.RepoAccount.Did)
+	bgs.didr.ClearCacheFor(env.RepoAccount.Did)
 
 	// Refetch the DID doc to make sure the PDS is still authoritative
 	ai, err := bgs.createExternalUser(ctx, env.RepoAccount.Did)

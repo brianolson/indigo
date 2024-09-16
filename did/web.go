@@ -63,7 +63,7 @@ var disallowedTlds = map[string]bool{
 	"internal": true,
 }
 
-func (wr *WebResolver) FlushCacheFor(did string) {
+func (wr *WebResolver) ClearCacheFor(did string) {
 	return
 }
 

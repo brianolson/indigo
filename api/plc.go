@@ -54,7 +54,7 @@ func (s *PLCServer) GetDocument(ctx context.Context, didstr string) (*did.Docume
 	return &doc, nil
 }
 
-func (s *PLCServer) FlushCacheFor(did string) {
+func (s *PLCServer) ClearCacheFor(did string) {
 	return
 }
 

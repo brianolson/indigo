@@ -34,7 +34,7 @@ func NewCachingDidResolver(res did.Resolver, maxAge time.Duration, size int) *Ca
 	}
 }
 
-func (r *CachingDidResolver) FlushCacheFor(didstr string) {
+func (r *CachingDidResolver) ClearCacheFor(didstr string) {
 	r.cache.Remove(didstr)
 }
 
