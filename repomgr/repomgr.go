@@ -504,16 +504,16 @@ func (rm *RepoManager) GetProfile(ctx context.Context, uid models.Uid) (*bsky.Ac
 	return ap, nil
 }
 
-func (rm *RepoManager) CheckRepoSig(ctx context.Context, r *repo.Repo, expdid string) error {
+func (rm *RepoManager) CheckRepoSig(ctx context.Context, xrepo *repo.Repo, expdid string) error {
 	ctx, span := otel.Tracer("repoman").Start(ctx, "CheckRepoSig")
 	defer span.End()
 
-	repoDid := r.RepoDid()
+	repoDid := xrepo.RepoDid()
 	if expdid != repoDid {
 		return fmt.Errorf("DID in repo did not match (%q != %q)", expdid, repoDid)
 	}
 
-	scom := r.SignedCommit()
+	scom := xrepo.SignedCommit()
 
 	usc := scom.Unsigned()
 	sb, err := usc.BytesForSigning()
@@ -543,12 +543,12 @@ func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, 
 		return fmt.Errorf("importing external carslice: %w", err)
 	}
 
-	r, err := repo.OpenRepo(ctx, ds, root)
+	xrepo, err := repo.OpenRepo(ctx, ds, root)
 	if err != nil {
 		return fmt.Errorf("opening external user repo (%d, root=%s): %w", uid, root, err)
 	}
 
-	if err := rm.CheckRepoSig(ctx, r, did); err != nil {
+	if err := rm.CheckRepoSig(ctx, xrepo, did); err != nil {
 		return err
 	}
 
@@ -594,7 +594,7 @@ func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, 
 			}
 
 			if rm.hydrateRecords {
-				_, rec, err := r.GetRecord(ctx, op.Path)
+				_, rec, err := xrepo.GetRecord(ctx, op.Path)
 				if err != nil {
 					return fmt.Errorf("reading changed record from car slice: %w", err)
 				}
@@ -611,7 +611,7 @@ func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, 
 			}
 
 			if rm.hydrateRecords {
-				_, rec, err := r.GetRecord(ctx, op.Path)
+				_, rec, err := xrepo.GetRecord(ctx, op.Path)
 				if err != nil {
 					return fmt.Errorf("reading changed record from car slice: %w", err)
 				}
