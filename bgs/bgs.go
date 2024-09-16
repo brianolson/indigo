@@ -41,6 +41,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 )
 
@@ -798,263 +799,272 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 
 	switch {
 	case env.RepoCommit != nil:
-		repoCommitsReceivedCounter.WithLabelValues(host.Host).Add(1)
-		evt := env.RepoCommit
-		log.Debugw("bgs got repo append event", "seq", evt.Seq, "host", host.Host, "repo", evt.Repo)
-		u, err := bgs.lookupUserByDid(ctx, evt.Repo)
-		if err != nil {
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("looking up event user: %w", err)
-			}
-
-			newUsersDiscovered.Inc()
-			subj, err := bgs.createExternalUser(ctx, evt.Repo)
-			if err != nil {
-				return fmt.Errorf("fed event create external user: %w", err)
-			}
-
-			u = new(User)
-			u.ID = subj.Uid
-			u.Did = evt.Repo
-		}
-
-		span.SetAttributes(attribute.String("upstream_status", u.UpstreamStatus))
-
-		if u.TakenDown || u.UpstreamStatus == events.AccountStatusTakendown {
-			span.SetAttributes(attribute.Bool("taken_down_by_relay_admin", u.TakenDown))
-			log.Debugw("dropping commit event from taken down user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
-			return nil
-		}
-
-		if u.UpstreamStatus == events.AccountStatusSuspended {
-			log.Debugw("dropping commit event from suspended user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
-			return nil
-		}
-
-		if u.UpstreamStatus == events.AccountStatusDeactivated {
-			log.Debugw("dropping commit event from deactivated user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
-			return nil
-		}
-
-		if evt.Rebase {
-			return fmt.Errorf("rebase was true in event seq:%d,host:%s", evt.Seq, host.Host)
-		}
-
-		if host.ID != u.PDS && u.PDS != 0 {
-			log.Warnw("received event for repo from different pds than expected", "repo", evt.Repo, "expPds", u.PDS, "gotPds", host.Host)
-			// Flush any cached DID documents for this user
-			bgs.didr.FlushCacheFor(env.RepoCommit.Repo)
-
-			subj, err := bgs.createExternalUser(ctx, evt.Repo)
-			if err != nil {
-				return err
-			}
-
-			if subj.PDS != host.ID {
-				return fmt.Errorf("event from non-authoritative pds")
-			}
-		}
-
-		if u.Tombstoned {
-			span.SetAttributes(attribute.Bool("tombstoned", true))
-			// we've checked the authority of the users PDS, so reinstate the account
-			if err := bgs.db.Model(&User{}).Where("id = ?", u.ID).UpdateColumn("tombstoned", false).Error; err != nil {
-				return fmt.Errorf("failed to un-tombstone a user: %w", err)
-			}
-
-			ai, err := bgs.Index.LookupUser(ctx, u.ID)
-			if err != nil {
-				return fmt.Errorf("failed to look up user (tombstone recover): %w", err)
-			}
-
-			// Now a simple re-crawl should suffice to bring the user back online
-			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
-		}
-
-		// skip the fast path for rebases or if the user is already in the slow path
-		if bgs.Index.Crawler.RepoInSlowPath(ctx, u.ID) {
-			rebasesCounter.WithLabelValues(host.Host).Add(1)
-			ai, err := bgs.Index.LookupUser(ctx, u.ID)
-			if err != nil {
-				return fmt.Errorf("failed to look up user (slow path): %w", err)
-			}
-
-			// TODO: we currently do not handle events that get queued up
-			// behind an already 'in progress' slow path event.
-			// this is strictly less efficient than it could be, and while it
-			// does 'work' (due to falling back to resyncing the repo), its
-			// technically incorrect. Now that we have the parallel event
-			// processor coming off of the pds stream, we should investigate
-			// whether or not we even need this 'slow path' logic, as it makes
-			// accounting for which events have been processed much harder
-			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
-		}
-
-		if err := bgs.repoman.HandleExternalUserEvent(ctx, host.ID, u.ID, u.Did, evt.Since, evt.Rev, evt.Blocks, evt.Ops); err != nil {
-			log.Warnw("failed handling event", "err", err, "host", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
-
-			if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
-				ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
-				if lerr != nil {
-					return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
-				}
-
-				span.SetAttributes(attribute.Bool("catchup_queue", true))
-
-				return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
-			}
-
-			return fmt.Errorf("handle user event failed: %w", err)
-		}
-
-		return nil
+		return bgs.handleRepoCommit(ctx, host, env, span)
 	case env.RepoHandle != nil:
-		log.Infow("bgs got repo handle event", "did", env.RepoHandle.Did, "handle", env.RepoHandle.Handle)
-		// Flush any cached DID documents for this user
-		bgs.didr.FlushCacheFor(env.RepoHandle.Did)
-
-		// TODO: ignoring the data in the message and just going out to the DID doc
-		act, err := bgs.createExternalUser(ctx, env.RepoHandle.Did)
-		if err != nil {
-			return err
-		}
-
-		if act.Handle.String != env.RepoHandle.Handle {
-			log.Warnw("handle update did not update handle to asserted value", "did", env.RepoHandle.Did, "expected", env.RepoHandle.Handle, "actual", act.Handle)
-		}
-
-		// TODO: Update the ReposHandle event type to include "verified" or something
-
-		// Broadcast the handle update to all consumers
-		err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
-			RepoHandle: &comatproto.SyncSubscribeRepos_Handle{
-				Did:    env.RepoHandle.Did,
-				Handle: env.RepoHandle.Handle,
-				Time:   env.RepoHandle.Time,
-			},
-		})
-		if err != nil {
-			log.Errorw("failed to broadcast RepoHandle event", "error", err, "did", env.RepoHandle.Did, "handle", env.RepoHandle.Handle)
-			return fmt.Errorf("failed to broadcast RepoHandle event: %w", err)
-		}
-
-		return nil
+		return bgs.handleRepoHandle(ctx, host, env)
 	case env.RepoIdentity != nil:
-		log.Infow("bgs got identity event", "did", env.RepoIdentity.Did)
-		// Flush any cached DID documents for this user
-		bgs.didr.FlushCacheFor(env.RepoIdentity.Did)
-
-		// Refetch the DID doc and update our cached keys and handle etc.
-		_, err := bgs.createExternalUser(ctx, env.RepoIdentity.Did)
-		if err != nil {
-			return err
-		}
-
-		// Broadcast the identity event to all consumers
-		err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
-			RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
-				Did:    env.RepoIdentity.Did,
-				Seq:    env.RepoIdentity.Seq,
-				Time:   env.RepoIdentity.Time,
-				Handle: env.RepoIdentity.Handle,
-			},
-		})
-		if err != nil {
-			log.Errorw("failed to broadcast Identity event", "error", err, "did", env.RepoIdentity.Did)
-			return fmt.Errorf("failed to broadcast Identity event: %w", err)
-		}
-
-		return nil
+		return bgs.handleRepoIdentity(ctx, host, env)
 	case env.RepoAccount != nil:
-		span.SetAttributes(
-			attribute.String("did", env.RepoAccount.Did),
-			attribute.Int64("seq", env.RepoAccount.Seq),
-			attribute.Bool("active", env.RepoAccount.Active),
-		)
-
-		if env.RepoAccount.Status != nil {
-			span.SetAttributes(attribute.String("repo_status", *env.RepoAccount.Status))
-		}
-
-		log.Infow("bgs got account event", "did", env.RepoAccount.Did)
-		// Flush any cached DID documents for this user
-		bgs.didr.FlushCacheFor(env.RepoAccount.Did)
-
-		// Refetch the DID doc to make sure the PDS is still authoritative
-		ai, err := bgs.createExternalUser(ctx, env.RepoAccount.Did)
-		if err != nil {
-			span.RecordError(err)
-			return err
-		}
-
-		// Check if the PDS is still authoritative
-		// if not we don't want to be propagating this account event
-		if ai.PDS != host.ID {
-			log.Errorw("account event from non-authoritative pds",
-				"seq", env.RepoAccount.Seq,
-				"did", env.RepoAccount.Did,
-				"event_from", host.Host,
-				"did_doc_declared_pds", ai.PDS,
-				"account_evt", env.RepoAccount,
-			)
-			return fmt.Errorf("event from non-authoritative pds")
-		}
-
-		// Process the account status change
-		repoStatus := events.AccountStatusActive
-		if !env.RepoAccount.Active && env.RepoAccount.Status != nil {
-			repoStatus = *env.RepoAccount.Status
-		}
-
-		err = bgs.UpdateAccountStatus(ctx, env.RepoAccount.Did, repoStatus)
-		if err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to update account status: %w", err)
-		}
-
-		shouldBeActive := env.RepoAccount.Active
-		status := env.RepoAccount.Status
-		u, err := bgs.lookupUserByDid(ctx, env.RepoAccount.Did)
-		if err != nil {
-			return fmt.Errorf("failed to look up user by did: %w", err)
-		}
-
-		if u.TakenDown {
-			shouldBeActive = false
-			status = &events.AccountStatusTakendown
-		}
-
-		// Broadcast the account event to all consumers
-		err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
-			RepoAccount: &comatproto.SyncSubscribeRepos_Account{
-				Did:    env.RepoAccount.Did,
-				Seq:    env.RepoAccount.Seq,
-				Time:   env.RepoAccount.Time,
-				Active: shouldBeActive,
-				Status: status,
-			},
-		})
-		if err != nil {
-			log.Errorw("failed to broadcast Account event", "error", err, "did", env.RepoAccount.Did)
-			return fmt.Errorf("failed to broadcast Account event: %w", err)
-		}
-
-		return nil
+		return bgs.handleRepoAccount(ctx, host, env, span)
 	case env.RepoMigrate != nil:
-		if _, err := bgs.createExternalUser(ctx, env.RepoMigrate.Did); err != nil {
-			return err
-		}
-
-		return nil
+		_, err := bgs.createExternalUser(ctx, env.RepoMigrate.Did)
+		return err
 	case env.RepoTombstone != nil:
-		if err := bgs.handleRepoTombstone(ctx, host, env.RepoTombstone); err != nil {
-			return err
-		}
-
-		return nil
+		return bgs.handleRepoTombstone(ctx, host, env.RepoTombstone)
 	default:
 		return fmt.Errorf("invalid fed event")
 	}
+}
+
+func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent, span trace.Span) error {
+	repoCommitsReceivedCounter.WithLabelValues(host.Host).Add(1)
+	evt := env.RepoCommit
+	log.Debugw("bgs got repo append event", "seq", evt.Seq, "host", host.Host, "repo", evt.Repo)
+	u, err := bgs.lookupUserByDid(ctx, evt.Repo)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("looking up event user: %w", err)
+		}
+
+		newUsersDiscovered.Inc()
+		subj, err := bgs.createExternalUser(ctx, evt.Repo)
+		if err != nil {
+			return fmt.Errorf("fed event create external user: %w", err)
+		}
+
+		u = new(User)
+		u.ID = subj.Uid
+		u.Did = evt.Repo
+	}
+
+	span.SetAttributes(attribute.String("upstream_status", u.UpstreamStatus))
+
+	if u.TakenDown || u.UpstreamStatus == events.AccountStatusTakendown {
+		span.SetAttributes(attribute.Bool("taken_down_by_relay_admin", u.TakenDown))
+		log.Debugw("dropping commit event from taken down user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
+		return nil
+	}
+
+	if u.UpstreamStatus == events.AccountStatusSuspended {
+		log.Debugw("dropping commit event from suspended user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
+		return nil
+	}
+
+	if u.UpstreamStatus == events.AccountStatusDeactivated {
+		log.Debugw("dropping commit event from deactivated user", "did", evt.Repo, "seq", evt.Seq, "host", host.Host)
+		return nil
+	}
+
+	if evt.Rebase {
+		return fmt.Errorf("rebase was true in event seq:%d,host:%s", evt.Seq, host.Host)
+	}
+
+	if host.ID != u.PDS && u.PDS != 0 {
+		log.Warnw("received event for repo from different pds than expected", "repo", evt.Repo, "expPds", u.PDS, "gotPds", host.Host)
+		// Flush any cached DID documents for this user
+		bgs.didr.FlushCacheFor(env.RepoCommit.Repo)
+
+		subj, err := bgs.createExternalUser(ctx, evt.Repo)
+		if err != nil {
+			return err
+		}
+
+		if subj.PDS != host.ID {
+			return fmt.Errorf("event from non-authoritative pds")
+		}
+	}
+
+	if u.Tombstoned {
+		span.SetAttributes(attribute.Bool("tombstoned", true))
+		// we've checked the authority of the users PDS, so reinstate the account
+		if err := bgs.db.Model(&User{}).Where("id = ?", u.ID).UpdateColumn("tombstoned", false).Error; err != nil {
+			return fmt.Errorf("failed to un-tombstone a user: %w", err)
+		}
+
+		ai, err := bgs.Index.LookupUser(ctx, u.ID)
+		if err != nil {
+			return fmt.Errorf("failed to look up user (tombstone recover): %w", err)
+		}
+
+		// Now a simple re-crawl should suffice to bring the user back online
+		return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+	}
+
+	// skip the fast path for rebases or if the user is already in the slow path
+	if bgs.Index.Crawler.RepoInSlowPath(ctx, u.ID) {
+		rebasesCounter.WithLabelValues(host.Host).Add(1)
+		ai, err := bgs.Index.LookupUser(ctx, u.ID)
+		if err != nil {
+			return fmt.Errorf("failed to look up user (slow path): %w", err)
+		}
+
+		// TODO: we currently do not handle events that get queued up
+		// behind an already 'in progress' slow path event.
+		// this is strictly less efficient than it could be, and while it
+		// does 'work' (due to falling back to resyncing the repo), its
+		// technically incorrect. Now that we have the parallel event
+		// processor coming off of the pds stream, we should investigate
+		// whether or not we even need this 'slow path' logic, as it makes
+		// accounting for which events have been processed much harder
+		return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+	}
+
+	if err := bgs.repoman.HandleExternalUserEvent(ctx, host.ID, u.ID, u.Did, evt.Since, evt.Rev, evt.Blocks, evt.Ops); err != nil {
+		log.Warnw("failed handling event", "err", err, "host", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+
+		if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
+			ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
+			if lerr != nil {
+				return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
+			}
+
+			span.SetAttributes(attribute.Bool("catchup_queue", true))
+
+			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+		}
+
+		return fmt.Errorf("handle user event failed: %w", err)
+	}
+
+	return nil
+}
+
+func (bgs *BGS) handleRepoHandle(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
+	log.Infow("bgs got repo handle event", "did", env.RepoHandle.Did, "handle", env.RepoHandle.Handle)
+	// Flush any cached DID documents for this user
+	bgs.didr.FlushCacheFor(env.RepoHandle.Did)
+
+	// TODO: ignoring the data in the message and just going out to the DID doc
+	act, err := bgs.createExternalUser(ctx, env.RepoHandle.Did)
+	if err != nil {
+		return err
+	}
+
+	if act.Handle.String != env.RepoHandle.Handle {
+		log.Warnw("handle update did not update handle to asserted value", "did", env.RepoHandle.Did, "expected", env.RepoHandle.Handle, "actual", act.Handle)
+	}
+
+	// TODO: Update the ReposHandle event type to include "verified" or something
+
+	// Broadcast the handle update to all consumers
+	err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoHandle: &comatproto.SyncSubscribeRepos_Handle{
+			Did:    env.RepoHandle.Did,
+			Handle: env.RepoHandle.Handle,
+			Time:   env.RepoHandle.Time,
+		},
+	})
+	if err != nil {
+		log.Errorw("failed to broadcast RepoHandle event", "error", err, "did", env.RepoHandle.Did, "handle", env.RepoHandle.Handle)
+		return fmt.Errorf("failed to broadcast RepoHandle event: %w", err)
+	}
+
+	return nil
+}
+
+func (bgs *BGS) handleRepoIdentity(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
+	log.Infow("bgs got identity event", "did", env.RepoIdentity.Did)
+	// Flush any cached DID documents for this user
+	bgs.didr.FlushCacheFor(env.RepoIdentity.Did)
+
+	// Refetch the DID doc and update our cached keys and handle etc.
+	_, err := bgs.createExternalUser(ctx, env.RepoIdentity.Did)
+	if err != nil {
+		return err
+	}
+
+	// Broadcast the identity event to all consumers
+	err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
+			Did:    env.RepoIdentity.Did,
+			Seq:    env.RepoIdentity.Seq,
+			Time:   env.RepoIdentity.Time,
+			Handle: env.RepoIdentity.Handle,
+		},
+	})
+	if err != nil {
+		log.Errorw("failed to broadcast Identity event", "error", err, "did", env.RepoIdentity.Did)
+		return fmt.Errorf("failed to broadcast Identity event: %w", err)
+	}
+
+	return nil
+}
+
+func (bgs *BGS) handleRepoAccount(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent, span trace.Span) error {
+	span.SetAttributes(
+		attribute.String("did", env.RepoAccount.Did),
+		attribute.Int64("seq", env.RepoAccount.Seq),
+		attribute.Bool("active", env.RepoAccount.Active),
+	)
+
+	if env.RepoAccount.Status != nil {
+		span.SetAttributes(attribute.String("repo_status", *env.RepoAccount.Status))
+	}
+
+	log.Infow("bgs got account event", "did", env.RepoAccount.Did)
+	// Flush any cached DID documents for this user
+	bgs.didr.FlushCacheFor(env.RepoAccount.Did)
+
+	// Refetch the DID doc to make sure the PDS is still authoritative
+	ai, err := bgs.createExternalUser(ctx, env.RepoAccount.Did)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	// Check if the PDS is still authoritative
+	// if not we don't want to be propagating this account event
+	if ai.PDS != host.ID {
+		log.Errorw("account event from non-authoritative pds",
+			"seq", env.RepoAccount.Seq,
+			"did", env.RepoAccount.Did,
+			"event_from", host.Host,
+			"did_doc_declared_pds", ai.PDS,
+			"account_evt", env.RepoAccount,
+		)
+		return fmt.Errorf("event from non-authoritative pds")
+	}
+
+	// Process the account status change
+	repoStatus := events.AccountStatusActive
+	if !env.RepoAccount.Active && env.RepoAccount.Status != nil {
+		repoStatus = *env.RepoAccount.Status
+	}
+
+	err = bgs.UpdateAccountStatus(ctx, env.RepoAccount.Did, repoStatus)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to update account status: %w", err)
+	}
+
+	shouldBeActive := env.RepoAccount.Active
+	status := env.RepoAccount.Status
+	u, err := bgs.lookupUserByDid(ctx, env.RepoAccount.Did)
+	if err != nil {
+		return fmt.Errorf("failed to look up user by did: %w", err)
+	}
+
+	if u.TakenDown {
+		shouldBeActive = false
+		status = &events.AccountStatusTakendown
+	}
+
+	// Broadcast the account event to all consumers
+	err = bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoAccount: &comatproto.SyncSubscribeRepos_Account{
+			Did:    env.RepoAccount.Did,
+			Seq:    env.RepoAccount.Seq,
+			Time:   env.RepoAccount.Time,
+			Active: shouldBeActive,
+			Status: status,
+		},
+	})
+	if err != nil {
+		log.Errorw("failed to broadcast Account event", "error", err, "did", env.RepoAccount.Did)
+		return fmt.Errorf("failed to broadcast Account event: %w", err)
+	}
+
+	return nil
 }
 
 func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *atproto.SyncSubscribeRepos_Tombstone) error {
