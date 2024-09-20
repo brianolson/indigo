@@ -373,6 +373,7 @@ func (bgs *BGS) StartWithListener(listen net.Listener) error {
 	admin.POST("/repo/compactAll", bgs.handleAdminCompactAllRepos)
 	admin.POST("/repo/reset", bgs.handleAdminResetRepo)
 	admin.POST("/repo/verify", bgs.handleAdminVerifyRepo)
+	admin.POST("/repo/truncate", bgs.handleAdminTruncateRepo)
 
 	// PDS-related Admin API
 	admin.POST("/pds/requestCrawl", bgs.handleAdminRequestCrawl)

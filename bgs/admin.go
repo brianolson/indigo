@@ -544,6 +544,36 @@ func (bgs *BGS) handleAdminResetRepo(e echo.Context) error {
 	})
 }
 
+func (bgs *BGS) handleAdminTruncateRepo(e echo.Context) error {
+	shards := 20
+	if nshardStr := e.QueryParam("shards"); nshardStr != "" {
+		ti, err := strconv.ParseInt(nshardStr, 0, 64)
+		if err != nil {
+			return errors.New("bad shards")
+		}
+		shards = int(ti)
+	}
+
+	did := e.QueryParam("did")
+	if did == "" {
+		return errors.New("did param required")
+	}
+
+	ctx := e.Request().Context()
+	ai, err := bgs.Index.LookupUserByDid(ctx, did)
+	if err != nil {
+		return fmt.Errorf("no such user: %w", err)
+	}
+
+	if err := bgs.repoman.TruncateRepo(ctx, ai.Uid, shards); err != nil {
+		return err
+	}
+
+	return e.JSON(200, map[string]any{
+		"success": true,
+	})
+}
+
 func (bgs *BGS) handleAdminVerifyRepo(e echo.Context) error {
 	ctx := e.Request().Context()
 

@@ -59,6 +59,7 @@ type CarStore interface {
 	ReadUserCar(ctx context.Context, user models.Uid, sinceRev string, incremental bool, w io.Writer) error
 	Stat(ctx context.Context, usr models.Uid) ([]UserStat, error)
 	WipeUserData(ctx context.Context, user models.Uid) error
+	TruncateShards(ctx context.Context, user models.Uid, nshardsToKeep int) error
 }
 
 type FileCarStore struct {
@@ -890,6 +891,29 @@ func (cs *FileCarStore) deleteShards(ctx context.Context, shs []CarShard) error 
 			return err
 		}
 	}
+
+	return nil
+}
+
+func (cs *FileCarStore) TruncateShards(ctx context.Context, user models.Uid, nshardsToKeep int) error {
+	shards, err := cs.meta.GetUserShards(ctx, user)
+	if err != nil {
+		return err
+	}
+
+	if len(shards) <= nshardsToKeep {
+		return nil
+	}
+
+	shardsToDrop := shards[:len(shards)-nshardsToKeep]
+
+	if err := cs.deleteShards(ctx, shardsToDrop); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	cs.removeLastShardCache(user)
 
 	return nil
 }

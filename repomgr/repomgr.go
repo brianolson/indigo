@@ -571,6 +571,7 @@ func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, 
 		}
 	}
 
+	// TODO: maybe this gets turned off for non-archival relay?
 	if err := ds.CalcDiff(ctx, skipcids); err != nil {
 		return fmt.Errorf("failed while calculating mst diff (since=%v): %w", since, err)
 
@@ -1080,4 +1081,11 @@ func (rm *RepoManager) VerifyRepo(ctx context.Context, uid models.Uid) error {
 	}
 
 	return nil
+}
+
+func (rm *RepoManager) TruncateRepo(ctx context.Context, uid models.Uid, shards int) error {
+	unlock := rm.lockUser(ctx, uid)
+	defer unlock()
+
+	return rm.cs.TruncateShards(ctx, uid, shards)
 }
