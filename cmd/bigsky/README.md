@@ -254,7 +254,7 @@ GET returns JSON list of records
   "RepoLimit": int,
   "HourlyEventLimit": int,
   "DailyEventLimit": int,
-  
+
   "HasActiveConnection": bool,
   "EventsSeenSinceStartup": int,
   "PerSecondEventRate": {"Max": float, "Window": float seconds},
