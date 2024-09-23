@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -188,10 +189,72 @@ func run(args []string) error {
 			EnvVars: []string{"RELAY_DID_CACHE_SIZE"},
 			Value:   5_000_000,
 		},
+		&cli.BoolFlag{
+			Name:  "non-archival",
+			Usage: "only keep most recent data",
+		},
+		&cli.StringFlag{
+			// TODO: nice parse (%f)([kMGT]?)([Bb]?)
+			Name:    "recent-cache-size",
+			Usage:   "bytes of recent firehose data to store",
+			EnvVars: []string{"RELAY_FIREHOSE_CACHE_SIZE"},
+			Value:   "5GB",
+		},
 	}
 
 	app.Action = runBigsky
 	return app.Run(os.Args)
+}
+
+// parse (%f)([kMGT]?)([Bb]?) into uint64 byte length
+func parseSize(arg string) (uint64, error) {
+	lastchar := arg[len(arg)-1]
+	bits := false
+	switch lastchar {
+	case 'b':
+		bits = true
+		arg = arg[:len(arg)-1]
+	case 'B':
+		// bytes (default)
+		arg = arg[:len(arg)-1]
+	default:
+		// fallthrough to multiplier suffix
+	}
+	lastchar = arg[len(arg)-1]
+	multiplier := uint64(1)
+	switch lastchar {
+	case 'k':
+		multiplier = 1000
+		arg = arg[:len(arg)-1]
+	case 'M':
+		multiplier = 1_000_000
+		arg = arg[:len(arg)-1]
+	case 'G':
+		multiplier = 1_000_000_000
+		arg = arg[:len(arg)-1]
+	case 'T':
+		multiplier = 1_000_000_000_000
+		arg = arg[:len(arg)-1]
+	default:
+		// fall through to number parse
+	}
+	fsize, err := strconv.ParseFloat(arg, 64)
+	if err == nil {
+		if bits {
+			fsize /= 8
+		}
+		fsize *= float64(multiplier)
+		return uint64(fsize), nil
+	}
+	isize, err := strconv.ParseUint(arg, 0, 64)
+	if err != nil {
+		return 0, err
+	}
+	if bits {
+		isize /= 8
+	}
+	isize *= multiplier
+	return isize, nil
 }
 
 func setupOTEL(cctx *cli.Context) error {
@@ -270,6 +333,12 @@ func runBigsky(cctx *cli.Context) error {
 		return err
 	}
 
+	recentCacheSizeStr := cctx.String("recent-cache-size")
+	recentCacheSize, err := parseSize(recentCacheSizeStr)
+	if err != nil {
+		return err
+	}
+
 	// ensure data directory exists; won't error if it does
 	datadir := cctx.String("data-dir")
 	csdir := filepath.Join(datadir, "carstore")
@@ -301,10 +370,13 @@ func runBigsky(cctx *cli.Context) error {
 	}
 
 	os.MkdirAll(filepath.Dir(csdir), os.ModePerm)
-	cstore, err := carstore.NewCarStore(csdb, csdir)
+	nonArchival := cctx.Bool("non-archival")
+	cstore, err := carstore.NewFileCarStore(csdb, csdir)
 	if err != nil {
 		return err
 	}
+	cstore.NonArchival = nonArchival
+	cstore.RecentCacheSize = recentCacheSize
 
 	mr := did.NewMultiResolver()
 
@@ -322,6 +394,7 @@ func runBigsky(cctx *cli.Context) error {
 	kmgr := indexer.NewKeyManager(cachedidr, nil)
 
 	repoman := repomgr.NewRepoManager(cstore, kmgr)
+	repoman.NonArchival = nonArchival
 
 	var persister events.EventPersistence
 

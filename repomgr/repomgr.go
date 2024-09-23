@@ -61,6 +61,9 @@ type RepoManager struct {
 
 	events         func(context.Context, *RepoEvent)
 	hydrateRecords bool
+
+	// should be the same as .NonArchival in underlying CarStore
+	NonArchival bool
 }
 
 type ActorInfo struct {
@@ -571,10 +574,12 @@ func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, 
 		}
 	}
 
-	// TODO: maybe this gets turned off for non-archival relay?
-	if err := ds.CalcDiff(ctx, skipcids); err != nil {
-		return fmt.Errorf("failed while calculating mst diff (since=%v): %w", since, err)
+	// in non-archival mode, don't try to match up with previous MST blocks
+	if !rm.NonArchival {
+		if err := ds.CalcDiff(ctx, skipcids); err != nil {
+			return fmt.Errorf("failed while calculating mst diff (since=%v): %w", since, err)
 
+		}
 	}
 
 	evtops := make([]RepoOp, 0, len(ops))

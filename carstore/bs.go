@@ -68,9 +68,20 @@ type FileCarStore struct {
 
 	lscLk          sync.Mutex
 	lastShardCache map[models.Uid]*CarShard
+
+	// NonArchival means we don't try to hold whole repos, but only the most {RecentCacheSize} bytes of traffic
+	NonArchival bool
+
+	// In NonArchival mode, keep this many bytes of recent traffic.
+	// (This allows a client to shut down, restart, and catch up)
+	RecentCacheSize uint64
 }
 
 func NewCarStore(meta *gorm.DB, root string) (CarStore, error) {
+	return NewFileCarStore(meta, root)
+}
+
+func NewFileCarStore(meta *gorm.DB, root string) (*FileCarStore, error) {
 	if _, err := os.Stat(root); err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
@@ -676,6 +687,9 @@ func (cs *FileCarStore) putShard(ctx context.Context, shard *CarShard, brefs []m
 	return nil
 }
 
+// Check new (Cid,Block) data against old MST in a Blockstore
+// Return errors at various points if the new data is incompatible.
+// Return set of orphan Cid no longer referenced in new tree.
 func BlockDiff(ctx context.Context, bs blockstore.Blockstore, oldroot cid.Cid, newcids map[cid.Cid]blockformat.Block, skipcids map[cid.Cid]bool) (map[cid.Cid]bool, error) {
 	ctx, span := otel.Tracer("repo").Start(ctx, "BlockDiff")
 	defer span.End()
