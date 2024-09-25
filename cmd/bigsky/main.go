@@ -194,7 +194,6 @@ func run(args []string) error {
 			Usage: "only keep most recent data",
 		},
 		&cli.StringFlag{
-			// TODO: nice parse (%f)([kMGT]?)([Bb]?)
 			Name:    "recent-cache-size",
 			Usage:   "bytes of recent firehose data to store",
 			EnvVars: []string{"RELAY_FIREHOSE_CACHE_SIZE"},
@@ -369,8 +368,12 @@ func runBigsky(cctx *cli.Context) error {
 		}
 	}
 
-	os.MkdirAll(filepath.Dir(csdir), os.ModePerm)
 	nonArchival := cctx.Bool("non-archival")
+
+	err = os.MkdirAll(filepath.Dir(csdir), os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("%s: could not mkdir -p, %w", csdir, err)
+	}
 	cstore, err := carstore.NewFileCarStore(csdb, csdir)
 	if err != nil {
 		return err

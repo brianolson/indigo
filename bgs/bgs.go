@@ -88,6 +88,8 @@ type BGS struct {
 
 	// Management of Compaction
 	compactor *Compactor
+
+	nonArchival bool
 }
 
 type PDSResync struct {
@@ -113,6 +115,7 @@ type BGSConfig struct {
 	DefaultRepoLimit  int64
 	ConcurrencyPerPDS int64
 	MaxQueuePerPDS    int64
+	NonArchival       bool
 }
 
 func DefaultBGSConfig() *BGSConfig {
@@ -122,6 +125,7 @@ func DefaultBGSConfig() *BGSConfig {
 		DefaultRepoLimit:  100,
 		ConcurrencyPerPDS: 100,
 		MaxQueuePerPDS:    1_000,
+		NonArchival:       false,
 	}
 }
 
@@ -130,6 +134,11 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 	if config == nil {
 		config = DefaultBGSConfig()
 	}
+
+	if config.NonArchival != repoman.NonArchival {
+		panic(fmt.Sprintf("BGS config NonArchival=%v but RepoManager.NonArchival=%v", config.NonArchival, repoman.NonArchival))
+	}
+
 	db.AutoMigrate(User{})
 	db.AutoMigrate(AuthToken{})
 	db.AutoMigrate(models.PDS{})
@@ -150,6 +159,8 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		consumers:   make(map[uint64]*SocketConsumer),
 
 		pdsResyncs: make(map[uint]*PDSResync),
+
+		nonArchival: config.NonArchival,
 	}
 
 	ix.CreateExternalUser = bgs.createExternalUser
@@ -158,6 +169,7 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 	slOpts.DefaultRepoLimit = config.DefaultRepoLimit
 	slOpts.ConcurrencyPerPDS = config.ConcurrencyPerPDS
 	slOpts.MaxQueuePerPDS = config.MaxQueuePerPDS
+	slOpts.NonArchival = config.NonArchival
 	s, err := NewSlurper(db, bgs.handleFedEvent, slOpts)
 	if err != nil {
 		return nil, err

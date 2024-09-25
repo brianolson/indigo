@@ -15,6 +15,7 @@ import (
 )
 
 type RepoStreamCallbacks struct {
+	// TODO: refactor all of these to take `ctx context.Context` from EventHandler
 	RepoCommit    func(evt *comatproto.SyncSubscribeRepos_Commit) error
 	RepoHandle    func(evt *comatproto.SyncSubscribeRepos_Handle) error
 	RepoIdentity  func(evt *comatproto.SyncSubscribeRepos_Identity) error
@@ -108,6 +109,7 @@ func (sr *instrumentedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// HandleRepoStream
 func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

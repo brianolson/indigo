@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +55,8 @@ type Slurper struct {
 	shutdownResult chan []error
 
 	ssl bool
+
+	nonArchival bool
 }
 
 type Limiters struct {
@@ -70,6 +74,7 @@ type SlurperOptions struct {
 	DefaultRepoLimit      int64
 	ConcurrencyPerPDS     int64
 	MaxQueuePerPDS        int64
+	NonArchival           bool
 }
 
 func DefaultSlurperOptions() *SlurperOptions {
@@ -82,6 +87,7 @@ func DefaultSlurperOptions() *SlurperOptions {
 		DefaultRepoLimit:      100,
 		ConcurrencyPerPDS:     100,
 		MaxQueuePerPDS:        1_000,
+		NonArchival:           false,
 	}
 }
 
@@ -112,6 +118,7 @@ func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, 
 		ssl:                   opts.SSL,
 		shutdownChan:          make(chan bool),
 		shutdownResult:        make(chan []error),
+		nonArchival:           opts.NonArchival,
 	}
 	if err := s.loadConfig(); err != nil {
 		return nil, err
@@ -451,6 +458,7 @@ func (s *Slurper) RestartAll() error {
 	return nil
 }
 
+// this runs in a go thread to be a client of some PDS's firehose
 func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, sub *activeSub) {
 	defer func() {
 		s.lk.Lock()
@@ -478,11 +486,22 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 		default:
 		}
 
-		url := fmt.Sprintf("%s://%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", protocol, host.Host, cursor)
+		urlBuilder := url.URL{
+			Scheme: protocol,
+			Host:   host.Host,
+			Path:   "/xrpc/com.atproto.sync.subscribeRepos",
+		}
+		if s.nonArchival && cursor == 0 {
+			// don't crawl from beginning in non-archival mode, just 'now' is good enough
+		} else {
+			var query url.Values
+			query.Set("cursor", strconv.FormatInt(cursor, 10))
+			urlBuilder.RawQuery = query.Encode()
+		}
+
+		url := urlBuilder.String()
 		con, res, err := d.DialContext(ctx, url, nil)
 		if err != nil {
-			log.Warnw("dialing failed", "pdsHost", host.Host, "err", err, "backoff", backoff)
-			time.Sleep(sleepForBackoff(backoff))
 			backoff++
 
 			if backoff > 15 {
@@ -494,6 +513,8 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 				return
 			}
 
+			log.Warnw("dialing failed", "pdsHost", host.Host, "err", err, "backoff", backoff)
+			time.Sleep(sleepForBackoff(backoff))
 			continue
 		}
 
@@ -509,6 +530,7 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 		}
 
 		if cursor > curCursor {
+			// successful connection, progress was made, reset backoff for future retry cycles
 			backoff = 0
 		}
 	}
@@ -530,6 +552,7 @@ var ErrTimeoutShutdown = fmt.Errorf("timed out waiting for new events")
 
 var EventsTimeout = time.Minute
 
+// handleConnection is the inner part of subscribeWithRedialer() which is the inbound firehose client thread function.
 func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *websocket.Conn, lastCursor *int64, sub *activeSub) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -656,6 +679,7 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 
 	instrumentedRSC := events.NewInstrumentedRepoStreamCallbacks(limiters, rsc.EventHandler)
 
+	// run 100 gothread workers on a 1000 element event queue
 	pool := parallel.NewScheduler(
 		100,
 		1_000,
