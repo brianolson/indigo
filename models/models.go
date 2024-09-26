@@ -111,7 +111,9 @@ type PDS struct {
 	Registered bool
 	Blocked    bool
 
-	RateLimit      float64
+	// TODO: rate of what?
+	RateLimit float64
+	// TODO: rate of what?
 	CrawlRateLimit float64
 
 	RepoCount int64

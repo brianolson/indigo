@@ -60,6 +60,7 @@ type CarStore interface {
 	Stat(ctx context.Context, usr models.Uid) ([]UserStat, error)
 	WipeUserData(ctx context.Context, user models.Uid) error
 	TruncateShards(ctx context.Context, user models.Uid, nshardsToKeep int) error
+	GlobalTruncateShards(ctx context.Context, shardBytes int64) error
 }
 
 type FileCarStore struct {
@@ -650,6 +651,7 @@ func (cs *FileCarStore) writeNewShard(ctx context.Context, root cid.Cid, rev str
 		offset += nw
 	}
 
+	buflen := buf.Len()
 	path, err := cs.writeNewShardFile(ctx, user, seq, buf.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("failed to write shard file: %w", err)
@@ -662,6 +664,7 @@ func (cs *FileCarStore) writeNewShard(ctx context.Context, root cid.Cid, rev str
 		Path:      path,
 		Usr:       user,
 		Rev:       rev,
+		Size:      int64(buflen),
 	}
 
 	if err := cs.putShard(ctx, &shard, brefs, rmcids, false); err != nil {
@@ -1400,5 +1403,51 @@ func (cs *FileCarStore) compactBucket(ctx context.Context, user models.Uid, b *c
 
 		return err
 	}
+	return nil
+}
+
+func (cs *FileCarStore) GlobalTruncateShards(ctx context.Context, shardBytes int64) error {
+	if shardBytes == 0 {
+		shardBytes = int64(cs.RecentCacheSize)
+	}
+	totalSize, err := cs.meta.GetShardsSumSize(ctx)
+	if err != nil {
+		return err
+	}
+
+	var targetSize int64
+	if totalSize > shardBytes {
+		// TODO: configurable trim size target
+		// cut back to 5% below limit
+		targetSize = int64(float64(shardBytes) * 0.95)
+	} else if totalSize > int64(float64(shardBytes)*0.99) {
+		// TODO: configurable trim size target
+		// cut back to 2% below limit
+		targetSize = int64(float64(shardBytes) * 0.98)
+	} else {
+		return nil
+	}
+
+	log.Infow("global truncate", "have", totalSize, "target", targetSize)
+
+	newTotalSize := totalSize
+	for newTotalSize > targetSize {
+		todel, err := cs.meta.GetOldestShards(ctx, 2000)
+		if err != nil {
+			return err
+		}
+		for i, shard := range todel {
+			newTotalSize -= shard.Size
+			if newTotalSize <= targetSize {
+				todel = todel[:i+1]
+				break
+			}
+		}
+		err = cs.deleteShards(ctx, todel)
+		if err != nil {
+			return err
+		}
+	}
+	log.Infow("global truncate done", "have", newTotalSize)
 	return nil
 }

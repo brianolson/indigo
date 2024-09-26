@@ -1094,3 +1094,7 @@ func (rm *RepoManager) TruncateRepo(ctx context.Context, uid models.Uid, shards 
 
 	return rm.cs.TruncateShards(ctx, uid, shards)
 }
+
+func (rm *RepoManager) GlobalTruncateShards(ctx context.Context, shardBytes int64) error {
+	return rm.cs.GlobalTruncateShards(ctx, shardBytes)
+}

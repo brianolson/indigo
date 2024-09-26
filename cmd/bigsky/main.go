@@ -199,6 +199,10 @@ func run(args []string) error {
 			EnvVars: []string{"RELAY_FIREHOSE_CACHE_SIZE"},
 			Value:   "5GB",
 		},
+		&cli.BoolFlag{
+			Name:  "allow-pds-relays",
+			Usage: "don't require that a record comes from its origin PDS",
+		},
 	}
 
 	app.Action = runBigsky
@@ -479,6 +483,8 @@ func runBigsky(cctx *cli.Context) error {
 	bgsConfig.ConcurrencyPerPDS = cctx.Int64("concurrency-per-pds")
 	bgsConfig.MaxQueuePerPDS = cctx.Int64("max-queue-per-pds")
 	bgsConfig.DefaultRepoLimit = cctx.Int64("default-repo-limit")
+	bgsConfig.NonArchival = nonArchival
+	bgsConfig.AllowPDSRelays = cctx.Bool("allow-pds-relays")
 	bgs, err := libbgs.NewBGS(db, ix, repoman, evtman, cachedidr, rf, hr, bgsConfig)
 	if err != nil {
 		return err

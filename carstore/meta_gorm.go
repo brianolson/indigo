@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/indigo/models"
@@ -18,6 +19,10 @@ import (
 
 type CarStoreGormMeta struct {
 	meta *gorm.DB
+
+	// TODO: metrics gauge on this
+	// use atomics on this outside of .Init()
+	totalSize int64
 }
 
 func (cs *CarStoreGormMeta) Init() error {
@@ -25,6 +30,9 @@ func (cs *CarStoreGormMeta) Init() error {
 		return err
 	}
 	if err := cs.meta.AutoMigrate(&staleRef{}); err != nil {
+		return err
+	}
+	if err := cs.meta.Raw("SELECT sum(size) FROM car_shards").Scan(&cs.totalSize).Error; err != nil {
 		return err
 	}
 	return nil
@@ -156,11 +164,18 @@ func (cs *CarStoreGormMeta) PutShardAndRefs(ctx context.Context, shard *CarShard
 	if err != nil {
 		return fmt.Errorf("failed to commit shard DB transaction: %w", err)
 	}
+	atomic.AddInt64(&cs.totalSize, shard.Size)
 	return nil
 }
 
 func (cs *CarStoreGormMeta) DeleteShardsAndRefs(ctx context.Context, ids []uint) error {
 	txn := cs.meta.Begin()
+
+	var deleteSize int64
+	if err := txn.Raw("SELECT sum(size) FROM car_shards WHERE id in (?)", ids).Scan(&deleteSize).Error; err != nil {
+		txn.Rollback()
+		return err
+	}
 
 	if err := txn.Delete(&CarShard{}, "id in (?)", ids).Error; err != nil {
 		txn.Rollback()
@@ -172,7 +187,12 @@ func (cs *CarStoreGormMeta) DeleteShardsAndRefs(ctx context.Context, ids []uint)
 		return err
 	}
 
-	return txn.Commit().Error
+	if err := txn.Commit().Error; err != nil {
+		return err
+	}
+
+	atomic.AddInt64(&cs.totalSize, 0-deleteSize)
+	return nil
 }
 
 func (cs *CarStoreGormMeta) GetBlockRefsForShards(ctx context.Context, shardIds []uint) ([]blockRef, error) {
@@ -241,6 +261,21 @@ func (cs *CarStoreGormMeta) SetStaleRef(ctx context.Context, uid models.Uid, sta
 	return nil
 }
 
+func (cs *CarStoreGormMeta) GetShardsSumSize(ctx context.Context) (int64, error) {
+	return atomic.LoadInt64(&cs.totalSize), nil
+	// var sizeSum uint64
+	// err = cs.meta.Raw("SELECT sum(size) FROM car_shards").Scan(&sizeSum).Error
+	// return sizeSum, err
+}
+
+func (cs *CarStoreGormMeta) GetOldestShards(ctx context.Context, limit int) ([]CarShard, error) {
+	var shards []CarShard
+	if err := cs.meta.Order("id asc").Limit(limit).Find(&shards).Error; err != nil {
+		return nil, err
+	}
+	return shards, nil
+}
+
 type CarShard struct {
 	ID        uint `gorm:"primarykey"`
 	CreatedAt time.Time
@@ -251,6 +286,8 @@ type CarShard struct {
 	Path      string
 	Usr       models.Uid `gorm:"index:idx_car_shards_usr;index:idx_car_shards_usr_seq,priority:1"`
 	Rev       string
+
+	Size int64
 }
 
 type blockRef struct {

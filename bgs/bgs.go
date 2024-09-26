@@ -89,7 +89,13 @@ type BGS struct {
 	// Management of Compaction
 	compactor *Compactor
 
+	ctx       context.Context
+	ctxCancel func()
+
 	nonArchival bool
+
+	// don't check that a message comes from the author DID's origin PDS
+	AllowPDSRelays bool
 }
 
 type PDSResync struct {
@@ -116,6 +122,9 @@ type BGSConfig struct {
 	ConcurrencyPerPDS int64
 	MaxQueuePerPDS    int64
 	NonArchival       bool
+
+	// don't check that a message comes from the author DID's origin PDS
+	AllowPDSRelays bool
 }
 
 func DefaultBGSConfig() *BGSConfig {
@@ -160,8 +169,11 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 
 		pdsResyncs: make(map[uint]*PDSResync),
 
-		nonArchival: config.NonArchival,
+		nonArchival:    config.NonArchival,
+		AllowPDSRelays: config.AllowPDSRelays,
 	}
+
+	bgs.ctx, bgs.ctxCancel = context.WithCancel(context.Background())
 
 	ix.CreateExternalUser = bgs.createExternalUser
 	slOpts := DefaultSlurperOptions()
@@ -181,10 +193,16 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		return nil, err
 	}
 
-	compactor := NewCompactor(nil)
-	compactor.requeueInterval = config.CompactInterval
-	compactor.Start(bgs)
-	bgs.compactor = compactor
+	if config.CompactInterval != 0 {
+		if config.NonArchival {
+			go globalTruncatorThread(bgs.ctx, bgs, config.CompactInterval)
+		} else {
+			compactor := NewCompactor(nil)
+			compactor.requeueInterval = config.CompactInterval
+			compactor.Start(bgs)
+			bgs.compactor = compactor
+		}
+	}
 
 	return bgs, nil
 }
@@ -409,13 +427,16 @@ func (bgs *BGS) StartWithListener(listen net.Listener) error {
 }
 
 func (bgs *BGS) Shutdown() []error {
+	defer bgs.ctxCancel()
 	errs := bgs.slurper.Shutdown()
 
 	if err := bgs.events.Shutdown(context.TODO()); err != nil {
 		errs = append(errs, err)
 	}
 
-	bgs.compactor.Shutdown()
+	if bgs.compactor != nil {
+		bgs.compactor.Shutdown()
+	}
 
 	return errs
 }
@@ -872,7 +893,10 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 		return fmt.Errorf("rebase was true in event seq:%d,host:%s", evt.Seq, host.Host)
 	}
 
-	if host.ID != u.PDS && u.PDS != 0 {
+	// TODO: should we mark a host PDS as a relay and expect messages from everywhere from it; or should we just turn off this check on some relays?
+	if bgs.AllowPDSRelays {
+		// don't check if we got the message from the origin PDS
+	} else if host.ID != u.PDS && u.PDS != 0 {
 		log.Warnw("received event for repo from different pds than expected", "repo", evt.Repo, "expPds", u.PDS, "gotPds", host.Host)
 		// Flush any cached DID documents for this user
 		bgs.didr.ClearCacheFor(env.RepoCommit.Repo)
@@ -883,7 +907,7 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 		}
 
 		if subj.PDS != host.ID {
-			return fmt.Errorf("event from non-authoritative pds")
+			return fmt.Errorf("commit event from non-authoritative pds")
 		}
 	}
 
@@ -1027,7 +1051,10 @@ func (bgs *BGS) handleRepoAccount(ctx context.Context, host *models.PDS, env *ev
 
 	// Check if the PDS is still authoritative
 	// if not we don't want to be propagating this account event
-	if ai.PDS != host.ID {
+	// TODO: should we mark a host PDS as a relay and expect messages from everywhere from it; or should we just turn off this check on some relays?
+	if bgs.AllowPDSRelays {
+		// don't check if we got the message from the origin PDS
+	} else if ai.PDS != host.ID {
 		log.Errorw("account event from non-authoritative pds",
 			"seq", env.RepoAccount.Seq,
 			"did", env.RepoAccount.Did,
@@ -1035,7 +1062,7 @@ func (bgs *BGS) handleRepoAccount(ctx context.Context, host *models.PDS, env *ev
 			"did_doc_declared_pds", ai.PDS,
 			"account_evt", env.RepoAccount,
 		)
-		return fmt.Errorf("event from non-authoritative pds")
+		return fmt.Errorf("account event from non-authoritative pds")
 	}
 
 	// Process the account status change

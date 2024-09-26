@@ -621,8 +621,37 @@ func (bgs *BGS) handleAdminAddTrustedDomain(e echo.Context) error {
 }
 
 type AdminRequestCrawlRequest struct {
-	Hostname string `json:"hostname"`
+	Hostname         string  `json:"hostname"`
+	RateLimit        float64 `json:"rate-limit"`
+	CrawlRateLimit   float64 `json:"crawl-rate-limit"`
+	RepoLimit        int64   `json:"repo-limit"`
+	HourlyEventLimit int64   `json:"hourly-limit"`
+	DailyEventLimit  int64   `json:"daily-limit"`
 }
+
+// func floatArg(e echo.Context, name string, defaultValue float64) (float64, error) {
+// 	stringValue := e.QueryParam(name)
+// 	if stringValue == "" {
+// 		return defaultValue, nil
+// 	}
+// 	fval, err := strconv.ParseFloat(stringValue, 64)
+// 	if err != nil {
+// 		err = echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("bad query param: %s, %s", name, err))
+// 	}
+// 	return fval, err
+// }
+
+// func int64Arg(e echo.Context, name string, defaultValue int64) (int64, error) {
+// 	stringValue := e.QueryParam(name)
+// 	if stringValue == "" {
+// 		return defaultValue, nil
+// 	}
+// 	ival, err := strconv.ParseInt(stringValue, 0, 64)
+// 	if err != nil {
+// 		err = echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("bad query param: %s, %s", name, err))
+// 	}
+// 	return ival, err
+// }
 
 func (bgs *BGS) handleAdminRequestCrawl(e echo.Context) error {
 	ctx := e.Request().Context()
@@ -674,6 +703,32 @@ func (bgs *BGS) handleAdminRequestCrawl(e echo.Context) error {
 	}
 
 	// Skip checking if the server is online for now
+	npds := models.PDS{
+		Host:             host,
+		SSL:              bgs.ssl,
+		Registered:       true,
+		RateLimit:        float64(bgs.slurper.DefaultPerSecondLimit),
+		HourlyEventLimit: bgs.slurper.DefaultPerHourLimit,
+		DailyEventLimit:  bgs.slurper.DefaultPerDayLimit,
+		CrawlRateLimit:   float64(bgs.slurper.DefaultCrawlLimit),
+		RepoLimit:        bgs.slurper.DefaultRepoLimit,
+	}
 
-	return bgs.slurper.SubscribeToPds(ctx, host, true, true) // Override Trusted Domain Check
+	if body.RateLimit != 0 {
+		npds.RateLimit = body.RateLimit
+	}
+	if body.CrawlRateLimit != 0 {
+		npds.CrawlRateLimit = body.CrawlRateLimit
+	}
+	if body.RepoLimit != 0 {
+		npds.RepoLimit = body.RepoLimit
+	}
+	if body.HourlyEventLimit != 0 {
+		npds.HourlyEventLimit = body.HourlyEventLimit
+	}
+	if body.DailyEventLimit != 0 {
+		npds.DailyEventLimit = body.DailyEventLimit
+	}
+
+	return bgs.slurper.SubscribeToPdsAdmin(ctx, npds, true) // Override Trusted Domain Check
 }

@@ -367,18 +367,32 @@ func (s *Slurper) canSlurpHost(host string) bool {
 	return !s.newSubsDisabled
 }
 
-func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool, adminOverride bool) error {
+func (s *Slurper) SubscribeToPds(ctx context.Context, host string) error {
+	npds := models.PDS{
+		Host:             host,
+		SSL:              s.ssl,
+		Registered:       true,
+		RateLimit:        float64(s.DefaultPerSecondLimit),
+		HourlyEventLimit: s.DefaultPerHourLimit,
+		DailyEventLimit:  s.DefaultPerDayLimit,
+		CrawlRateLimit:   float64(s.DefaultCrawlLimit),
+		RepoLimit:        s.DefaultRepoLimit,
+	}
+	return s.SubscribeToPdsAdmin(ctx, npds, false)
+}
+
+func (s *Slurper) SubscribeToPdsAdmin(ctx context.Context, npds models.PDS, adminOverride bool) error {
 	// TODO: for performance, lock on the hostname instead of global
 	s.lk.Lock()
 	defer s.lk.Unlock()
 
-	_, ok := s.active[host]
+	_, ok := s.active[npds.Host]
 	if ok {
 		return nil
 	}
 
 	var peering models.PDS
-	if err := s.db.Find(&peering, "host = ?", host).Error; err != nil {
+	if err := s.db.Find(&peering, "host = ?", npds.Host).Error; err != nil {
 		return err
 	}
 
@@ -387,20 +401,10 @@ func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool, adm
 	}
 
 	if peering.ID == 0 {
-		if !adminOverride && !s.canSlurpHost(host) {
+		if !adminOverride && !s.canSlurpHost(npds.Host) {
 			return ErrNewSubsDisabled
 		}
 		// New PDS!
-		npds := models.PDS{
-			Host:             host,
-			SSL:              s.ssl,
-			Registered:       reg,
-			RateLimit:        float64(s.DefaultPerSecondLimit),
-			HourlyEventLimit: s.DefaultPerHourLimit,
-			DailyEventLimit:  s.DefaultPerDayLimit,
-			CrawlRateLimit:   float64(s.DefaultCrawlLimit),
-			RepoLimit:        s.DefaultRepoLimit,
-		}
 		if err := s.db.Create(&npds).Error; err != nil {
 			return err
 		}
@@ -408,7 +412,7 @@ func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool, adm
 		peering = npds
 	}
 
-	if !peering.Registered && reg {
+	if !peering.Registered && npds.Registered {
 		peering.Registered = true
 		if err := s.db.Model(models.PDS{}).Where("id = ?", peering.ID).Update("registered", true).Error; err != nil {
 			return err
@@ -421,7 +425,7 @@ func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool, adm
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	s.active[host] = &sub
+	s.active[npds.Host] = &sub
 
 	s.GetOrCreateLimiters(peering.ID, int64(peering.RateLimit), peering.HourlyEventLimit, peering.DailyEventLimit)
 
@@ -494,7 +498,7 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 		if s.nonArchival && cursor == 0 {
 			// don't crawl from beginning in non-archival mode, just 'now' is good enough
 		} else {
-			var query url.Values
+			query := url.Values(make(map[string][]string))
 			query.Set("cursor", strconv.FormatInt(cursor, 10))
 			urlBuilder.RawQuery = query.Encode()
 		}
@@ -513,7 +517,7 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 				return
 			}
 
-			log.Warnw("dialing failed", "pdsHost", host.Host, "err", err, "backoff", backoff)
+			log.Warnw("dialing failed", "pdsHost", host.Host, "url", url, "err", err, "backoff", backoff)
 			time.Sleep(sleepForBackoff(backoff))
 			continue
 		}
