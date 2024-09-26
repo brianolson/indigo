@@ -928,7 +928,7 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 	}
 
 	// skip the fast path for rebases or if the user is already in the slow path
-	if bgs.Index.Crawler.RepoInSlowPath(ctx, u.ID) {
+	if (bgs.Index.Crawler != nil) && bgs.Index.Crawler.RepoInSlowPath(ctx, u.ID) {
 		rebasesCounter.WithLabelValues(host.Host).Add(1)
 		ai, err := bgs.Index.LookupUser(ctx, u.ID)
 		if err != nil {
@@ -955,9 +955,13 @@ func (bgs *BGS) handleRepoCommit(ctx context.Context, host *models.PDS, env *eve
 				return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
 			}
 
-			span.SetAttributes(attribute.Bool("catchup_queue", true))
+			if bgs.Index.Crawler != nil {
+				span.SetAttributes(attribute.Bool("catchup_queue", true))
 
-			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+				return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+			} else {
+				return nil
+			}
 		}
 
 		return fmt.Errorf("handle user event failed: %w", err)
@@ -1113,7 +1117,9 @@ func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *a
 		return err
 	}
 
-	if u.PDS != pds.ID {
+	if bgs.AllowPDSRelays {
+		// don't care if source PDS/relay is original PDS
+	} else if u.PDS != pds.ID {
 		return fmt.Errorf("unauthoritative tombstone event from %s for %s", pds.Host, evt.Did)
 	}
 

@@ -535,8 +535,10 @@ func (bgs *BGS) handleAdminResetRepo(e echo.Context) error {
 		return err
 	}
 
-	if err := bgs.Index.Crawler.Crawl(ctx, ai); err != nil {
-		return err
+	if !bgs.nonArchival {
+		if err := bgs.Index.Crawler.Crawl(ctx, ai); err != nil {
+			return err
+		}
 	}
 
 	return e.JSON(200, map[string]any{

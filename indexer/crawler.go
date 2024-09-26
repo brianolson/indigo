@@ -24,7 +24,7 @@ type CrawlDispatcher struct {
 	todo       map[models.Uid]*crawlWork
 	inProgress map[models.Uid]*crawlWork
 
-	doRepoCrawl func(context.Context, *crawlWork) error
+	doRepoCrawl func(context.Context, *crawlWork) error // always points to fetcher.FetchAndIndexRepo
 
 	concurrency int
 }
@@ -204,6 +204,7 @@ func (c *CrawlDispatcher) fetchWorker() {
 	for {
 		select {
 		case job := <-c.repoSync:
+			// doRepoCrawl is fetcher.FetchAndIndexRepo()
 			if err := c.doRepoCrawl(context.TODO(), job); err != nil {
 				log.Errorf("failed to perform repo crawl of %q: %s", job.act.Did, err)
 			}

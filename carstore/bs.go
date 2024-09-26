@@ -343,7 +343,9 @@ func (cs *FileCarStore) NewDeltaSession(ctx context.Context, user models.Uid, si
 		return nil, err
 	}
 
-	if since != nil && *since != lastShard.Rev {
+	if cs.NonArchival && lastShard.Rev == "" {
+		// no previous to match, it got truncated, that's okay
+	} else if since != nil && *since != lastShard.Rev {
 		return nil, fmt.Errorf("revision mismatch: %s != %s: %w", *since, lastShard.Rev, ErrRepoBaseMismatch)
 	}
 

@@ -426,7 +426,8 @@ func runBigsky(cctx *cli.Context) error {
 
 	rf := indexer.NewRepoFetcher(db, repoman, cctx.Int("max-fetch-concurrency"))
 
-	ix, err := indexer.NewIndexer(db, notifman, evtman, cachedidr, rf, true, cctx.Bool("spidering"), false)
+	indexerShouldCrawlRepos := !nonArchival
+	ix, err := indexer.NewIndexer(db, notifman, evtman, cachedidr, rf, indexerShouldCrawlRepos, cctx.Bool("spidering"), false)
 	if err != nil {
 		return err
 	}
