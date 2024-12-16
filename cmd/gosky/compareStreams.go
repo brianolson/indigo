@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -13,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -28,7 +28,7 @@ type compareStreamsSession struct {
 }
 
 func (ses *compareStreamsSession) printCurrentDelta(out io.Writer) (int, error) {
-	var sb strings.Builder
+	var sb bytes.Buffer
 	for i, stm := range ses.streams {
 		if i > 0 {
 			sb.WriteString(", ")
@@ -36,7 +36,7 @@ func (ses *compareStreamsSession) printCurrentDelta(out io.Writer) (int, error) 
 		fmt.Fprintf(&sb, "[%d] %d pending", i, stm.pendingCount)
 	}
 	fmt.Fprintf(&sb, ", %d matched\n", ses.matches)
-	return out.Write([]byte(sb.String()))
+	return out.Write(sb.Bytes())
 }
 func (ses *compareStreamsSession) printDetailedDelta(out io.Writer) {
 	for did, sl := range ses.streams[0].buffer {
@@ -66,6 +66,7 @@ func (ses *compareStreamsSession) run(url1, url2 string) error {
 
 	totalEventCount := uint64(0)
 	nextLog := time.Now().Add(logPeriod)
+	logPrintCount := 0
 	// Compare events from the two URLs
 	for {
 		select {
@@ -96,6 +97,18 @@ func (ses *compareStreamsSession) run(url1, url2 string) error {
 			now := time.Now()
 			if now.After(nextLog) {
 				ses.printCurrentDelta(out)
+				logPrintCount++
+				if logPrintCount%20 == 0 {
+					var sb bytes.Buffer
+					for i, stm := range ses.streams {
+						if i > 0 {
+							sb.WriteString(", ")
+						}
+						fmt.Fprintf(&sb, "[%d] %s", i, stm.url)
+					}
+					sb.WriteRune('\n')
+					out.Write(sb.Bytes())
+				}
 				nextLog = now.Add(logPeriod)
 				for now.After(nextLog) {
 					nextLog = now.Add(logPeriod)
