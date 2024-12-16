@@ -783,6 +783,14 @@ func (rm *RepoManager) BatchWrite(ctx context.Context, user models.Uid, writes [
 	return nil
 }
 
+// struct passed down through a few layers of inner functions inside ImportNewRepo()
+type newRepoState struct {
+	user    models.Uid
+	repoDid string
+	currev  string
+	curhead cid.Cid
+}
+
 func (rm *RepoManager) ImportNewRepo(ctx context.Context, user models.Uid, repoDid string, r io.Reader, rev *string) error {
 	ctx, span := otel.Tracer("repoman").Start(ctx, "ImportNewRepo")
 	defer span.End()
@@ -806,67 +814,140 @@ func (rm *RepoManager) ImportNewRepo(ctx context.Context, user models.Uid, repoD
 		curhead = cid.Undef
 	}
 
+	nrstate := newRepoState{
+		user:    user,
+		repoDid: repoDid,
+		currev:  currev,
+		curhead: curhead,
+	}
+
 	if rev != nil && *rev != currev {
 		// TODO: we could probably just deal with this
 		return fmt.Errorf("ImportNewRepo called with incorrect base")
 	}
 
-	err = rm.processNewRepo(ctx, user, r, rev, func(ctx context.Context, root cid.Cid, finish func(context.Context, string) ([]byte, error), bs blockstore.Blockstore) error {
-		r, err := repo.OpenRepo(ctx, bs, root)
+	err = rm.processNewRepo(ctx, &nrstate, r, rev)
+	if err != nil {
+		return fmt.Errorf("process new repo (current rev: %s): %w:", currev, err)
+	}
+
+	return nil
+}
+
+func (rm *RepoManager) processNewRepo(ctx context.Context, nrstate *newRepoState, r io.Reader, rev *string) error {
+	ctx, span := otel.Tracer("repoman").Start(ctx, "processNewRepo")
+	defer span.End()
+
+	carr, err := car.NewCarReader(r)
+	if err != nil {
+		return err
+	}
+
+	if len(carr.Header.Roots) != 1 {
+		return fmt.Errorf("invalid car file, header must have a single root (has %d)", len(carr.Header.Roots))
+	}
+
+	membs := blockstore.NewBlockstore(datastore.NewMapDatastore())
+
+	for {
+		blk, err := carr.Next()
 		if err != nil {
-			return fmt.Errorf("opening new repo: %w", err)
-		}
-
-		scom := r.SignedCommit()
-
-		usc := scom.Unsigned()
-		sb, err := usc.BytesForSigning()
-		if err != nil {
-			return fmt.Errorf("commit serialization failed: %w", err)
-		}
-		if err := rm.kmgr.VerifyUserSignature(ctx, repoDid, scom.Sig, sb); err != nil {
-			return fmt.Errorf("new user signature check failed: %w", err)
-		}
-
-		diffops, err := r.DiffSince(ctx, curhead)
-		if err != nil {
-			return fmt.Errorf("diff trees (curhead: %s): %w", curhead, err)
-		}
-
-		ops := make([]RepoOp, 0, len(diffops))
-		for _, op := range diffops {
-			repoOpsImported.Inc()
-			out, err := rm.processOp(ctx, bs, op, rm.hydrateRecords)
-			if err != nil {
-				rm.log.Error("failed to process repo op", "err", err, "path", op.Rpath, "repo", repoDid)
+			if err == io.EOF {
+				break
 			}
-
-			if out != nil {
-				ops = append(ops, *out)
-			}
-		}
-
-		slice, err := finish(ctx, scom.Rev)
-		if err != nil {
 			return err
 		}
 
-		if rm.events != nil {
-			rm.events(ctx, &RepoEvent{
-				User: user,
-				//OldRoot:   oldroot,
-				NewRoot:   root,
-				Rev:       scom.Rev,
-				Since:     &currev,
-				RepoSlice: slice,
-				Ops:       ops,
-			})
+		if err := membs.Put(ctx, blk); err != nil {
+			return err
+		}
+	}
+
+	seen := make(map[cid.Cid]bool)
+
+	root := carr.Header.Roots[0]
+	// TODO: if there are blocks that get convergently recreated throughout
+	// the repos lifecycle, this will end up erroneously not including
+	// them. We should compute the set of blocks needed to read any repo
+	// ops that happened in the commit and use that for our 'output' blocks
+	cids, err := rm.walkTree(ctx, seen, root, membs, true)
+	if err != nil {
+		return fmt.Errorf("walkTree: %w", err)
+	}
+
+	ds, err := rm.cs.NewDeltaSession(ctx, nrstate.user, rev)
+	if err != nil {
+		return fmt.Errorf("opening delta session: %w", err)
+	}
+
+	for _, c := range cids {
+		blk, err := membs.Get(ctx, c)
+		if err != nil {
+			return fmt.Errorf("copying walked cids to carstore: %w", err)
 		}
 
-		return nil
-	})
+		if err := ds.Put(ctx, blk); err != nil {
+			return err
+		}
+	}
+
+	if err := rm.processNewRepoInner(ctx, nrstate, root, ds); err != nil {
+		return fmt.Errorf("cb errored root: %s, rev: %s: %w", root, stringOrNil(rev), err)
+	}
+
+	return nil
+}
+
+func (rm *RepoManager) processNewRepoInner(ctx context.Context, nrstate *newRepoState, root cid.Cid, ds *carstore.DeltaSession) error {
+	r, err := repo.OpenRepo(ctx, ds, root)
 	if err != nil {
-		return fmt.Errorf("process new repo (current rev: %s): %w:", currev, err)
+		return fmt.Errorf("opening new repo: %w", err)
+	}
+
+	scom := r.SignedCommit()
+
+	usc := scom.Unsigned()
+	sb, err := usc.BytesForSigning()
+	if err != nil {
+		return fmt.Errorf("commit serialization failed: %w", err)
+	}
+	if err := rm.kmgr.VerifyUserSignature(ctx, nrstate.repoDid, scom.Sig, sb); err != nil {
+		return fmt.Errorf("new user signature check failed: %w", err)
+	}
+
+	diffops, err := r.DiffSince(ctx, nrstate.curhead)
+	if err != nil {
+		return fmt.Errorf("diff trees (curhead: %s): %w", nrstate.curhead, err)
+	}
+
+	ops := make([]RepoOp, 0, len(diffops))
+	for _, op := range diffops {
+		repoOpsImported.Inc()
+		out, err := rm.processOp(ctx, ds, op, rm.hydrateRecords)
+		if err != nil {
+			rm.log.Error("failed to process repo op", "err", err, "path", op.Rpath, "repo", nrstate.repoDid)
+		}
+
+		if out != nil {
+			ops = append(ops, *out)
+		}
+	}
+
+	slice, err := ds.CloseWithRoot(ctx, root, scom.Rev)
+	if err != nil {
+		return err
+	}
+
+	if rm.events != nil {
+		rm.events(ctx, &RepoEvent{
+			User: nrstate.user,
+			//OldRoot:   oldroot,
+			NewRoot:   root,
+			Rev:       scom.Rev,
+			Since:     &nrstate.currev,
+			RepoSlice: slice,
+			Ops:       ops,
+		})
 	}
 
 	return nil
@@ -923,74 +1004,6 @@ func (rm *RepoManager) processOp(ctx context.Context, bs blockstore.Blockstore, 
 	default:
 		return nil, fmt.Errorf("diff returned invalid op type: %q", op.Op)
 	}
-}
-
-func (rm *RepoManager) processNewRepo(ctx context.Context, user models.Uid, r io.Reader, rev *string, cb func(ctx context.Context, root cid.Cid, finish func(context.Context, string) ([]byte, error), bs blockstore.Blockstore) error) error {
-	ctx, span := otel.Tracer("repoman").Start(ctx, "processNewRepo")
-	defer span.End()
-
-	carr, err := car.NewCarReader(r)
-	if err != nil {
-		return err
-	}
-
-	if len(carr.Header.Roots) != 1 {
-		return fmt.Errorf("invalid car file, header must have a single root (has %d)", len(carr.Header.Roots))
-	}
-
-	membs := blockstore.NewBlockstore(datastore.NewMapDatastore())
-
-	for {
-		blk, err := carr.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-
-		if err := membs.Put(ctx, blk); err != nil {
-			return err
-		}
-	}
-
-	seen := make(map[cid.Cid]bool)
-
-	root := carr.Header.Roots[0]
-	// TODO: if there are blocks that get convergently recreated throughout
-	// the repos lifecycle, this will end up erroneously not including
-	// them. We should compute the set of blocks needed to read any repo
-	// ops that happened in the commit and use that for our 'output' blocks
-	cids, err := rm.walkTree(ctx, seen, root, membs, true)
-	if err != nil {
-		return fmt.Errorf("walkTree: %w", err)
-	}
-
-	ds, err := rm.cs.NewDeltaSession(ctx, user, rev)
-	if err != nil {
-		return fmt.Errorf("opening delta session: %w", err)
-	}
-
-	for _, c := range cids {
-		blk, err := membs.Get(ctx, c)
-		if err != nil {
-			return fmt.Errorf("copying walked cids to carstore: %w", err)
-		}
-
-		if err := ds.Put(ctx, blk); err != nil {
-			return err
-		}
-	}
-
-	finish := func(ctx context.Context, nrev string) ([]byte, error) {
-		return ds.CloseWithRoot(ctx, root, nrev)
-	}
-
-	if err := cb(ctx, root, finish, ds); err != nil {
-		return fmt.Errorf("cb errored root: %s, rev: %s: %w", root, stringOrNil(rev), err)
-	}
-
-	return nil
 }
 
 func stringOrNil(s *string) string {
