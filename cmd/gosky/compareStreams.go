@@ -30,12 +30,12 @@ type compareStreamsSession struct {
 func (ses *compareStreamsSession) printCurrentDelta(out io.Writer) (int, error) {
 	var sb strings.Builder
 	for i, stm := range ses.streams {
-		fmt.Fprintf(&sb, "[%d] %d pending", i, stm.pendingCount)
 		if i > 0 {
 			sb.WriteString(", ")
 		}
+		fmt.Fprintf(&sb, "[%d] %d pending", i, stm.pendingCount)
 	}
-	sb.WriteRune('\n')
+	fmt.Fprintf(&sb, ", %d matched\n", ses.matches)
 	return out.Write([]byte(sb.String()))
 }
 func (ses *compareStreamsSession) printDetailedDelta(out io.Writer) {
