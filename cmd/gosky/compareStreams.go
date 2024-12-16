@@ -48,12 +48,15 @@ func (ses *compareStreamsSession) printDetailedDelta(out io.Writer) {
 }
 
 func (ses *compareStreamsSession) run(url1, url2 string) error {
+	ses.spreadWindowedAverage.WindowSize = 100
+	ses.streams = make([]compareStreamsStream, 2)
 	d := websocket.DefaultDialer
 	events := make(chan indexedEvent, 10)
 	// Create two goroutines for reading events from two URLs
 	for i, url := range []string{url1, url2} {
-		ses := newCompareStreamsStream(url, i, events)
-		go ses.run(d)
+		str := newCompareStreamsStream(url, i, events)
+		go str.run(d)
+		ses.streams[i] = *str
 	}
 	logPeriod := time.Second
 	out := os.Stdout
@@ -178,7 +181,7 @@ func (cstream *compareStreamsStream) findMatchAndRemove(event indexedEvent) (fou
 		if ev.event.Commit == event.event.Commit {
 			if llpEq(ev.event.Prev, event.event.Prev) {
 				// same commit different prev??
-				return false, 0, fmt.Errorf("matched event with same commit but different prev: (%d) %d - %d", cstream.n, ev.event.Seq, event.event.Seq)
+				return false, 0, fmt.Errorf("matched event with same commit but different prev: (%d) (seq=%d prev %#v) (seq=%d prev %#v)", cstream.n, ev.event.Seq, ev.event.Prev, event.event.Seq, event.event.Prev)
 			}
 		}
 
