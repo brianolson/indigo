@@ -179,7 +179,7 @@ func (cstream *compareStreamsStream) findMatchAndRemove(event indexedEvent) (fou
 
 	for i, ev := range slice {
 		if ev.event.Commit == event.event.Commit {
-			if llpEq(ev.event.Prev, event.event.Prev) {
+			if !llpEq(ev.event.Prev, event.event.Prev) {
 				// same commit different prev??
 				return false, 0, fmt.Errorf("matched event with same commit but different prev: (%d) (seq=%d prev %#v) (seq=%d prev %#v)", cstream.n, ev.event.Seq, ev.event.Prev, event.event.Seq, event.event.Prev)
 			}
