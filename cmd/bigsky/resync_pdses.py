@@ -24,16 +24,23 @@ def checkLimits(limits):
     return True
 
 class relay:
-    def __init__(self, rooturl, headers=None, session=None):
+    def __init__(self, args, headers=None, session=None):
         "rooturl string, headers dict or None, session requests.Session() or None"
-        self.rooturl = rooturl
+        self.rooturl = args.url
+        self.dryrun = args.dry_run
         self.headers = headers or dict()
         self.session = session or requests.Session()
 
     def resync(self, host):
         "host string"
         url = urllib.parse.urljoin(self.rooturl, '/admin/pds/resync')
-        response = self.session.post(url, params={"host": host}, headers=self.headers, data='')
+        query = {"host": host}
+        if self.dryrun:
+            urlq = url + '?' + urllib.parse.urlencode(query)
+            ch = curlHeaders(self.headers)
+            print(f"curl --silent --data '' {ch} '{urlq}'")
+            return
+        response = self.session.post(url, params=query, headers=self.headers, data='')
         if response.status_code != 200:
             sys.stderr.write(f"{url}?host={host} : ({response.status_code}) ({response.text!r})\n")
         else:
@@ -59,6 +66,10 @@ class relay:
             sys.stderr.write(f"{url} {host} : {response.status_code} {response.text!r}\n")
             return
         sys.stderr.write(f"requestCrawl + changeLimits {host} OK\n")
+
+
+def curlHeaders(headers):
+    return ' '.join([f"-H '{k}: {v}'" for k,v in headers.items()])
 
 
 def fromtext(args, relaySession, fin, limits):
@@ -97,11 +108,12 @@ def main():
     ap.add_argument('--resync', default=False, action='store_true', help='resync selected PDSes')
     ap.add_argument('--limits', default=None, help='json pds rate limits')
     ap.add_argument('--crawl', default=False, action='store_true', help='crawl & set limits')
+    ap.add_argument('--dry-run', default=False, action='store_true', help='print URLs that would be used')
     args = ap.parse_args()
 
     headers = {'Authorization': 'Bearer ' + args.admin_key}
 
-    relaySession = relay(args.url, headers)
+    relaySession = relay(args, headers)
 
     #url = urllib.parse.urljoin(args.url, '/admin/pds/resync')
 
