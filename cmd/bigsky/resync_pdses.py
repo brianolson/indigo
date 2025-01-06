@@ -60,8 +60,18 @@ class relay:
             return
         sys.stderr.write(f"requestCrawl + changeLimits {host} OK\n")
 
+    def block(self, host):
+        "host string"
+        url = urllib.parse.urljoin(self.rooturl, '/admin/pds/block')
+        response = self.session.post(url, params={"host": host}, headers=self.headers, data='')
+        if response.status_code != 200:
+            sys.stderr.write(f"{url}?host={host} : ({response.status_code}) ({response.text!r})\n")
+        else:
+            sys.stderr.write(f"{url}?host={host} : OK\n")
 
-def fromtext(args, relaySession, fin, limits):
+
+# TODO: lift common parts of copy_pdses and resync_pdses
+def fromtext(fin):
     for line in fin:
         if not line:
             continue
@@ -71,21 +81,16 @@ def fromtext(args, relaySession, fin, limits):
         if line[0] == '#':
             continue
         host = line
-        if args.crawl:
-            relaySession.crawlAndSetLimits(host, limits)
-        elif args.resync:
-            relaySession.resync(host)
+        yield host
 
-def fromcsv(args, relaySession, fin, limits):
+
+def fromcsv(fin):
     reader = csv.DictReader(fin)
     for row in reader:
         host = row.get('host') or row.get('hostname')
         if not host:
             raise Exception("no host in: " + repr(list(keys(row))))
-        if args.crawl:
-            relaySession.crawlAndSetLimits(host, limits)
-        elif args.resync:
-            relaySession.resync(host)
+        yield host
 
 def main():
     import argparse
@@ -123,9 +128,16 @@ def main():
     else:
         fin = open(args.input, 'rt')
     if args.csv or args.input.endswith('.csv'):
-        fromcsv(args, relaySession, fin, limits)
+        source = fromcsv(fin)
     else:
-        fromtext(args, relaySession, fin, limits)
+        source = fromtext(fin)
+    for host in source:
+        if args.crawl:
+            relaySession.crawlAndSetLimits(host, limits)
+        elif args.resync:
+            relaySession.resync(host)
+        elif args.block:
+            relaySession.block(host)
 
 
 if __name__ == '__main__':

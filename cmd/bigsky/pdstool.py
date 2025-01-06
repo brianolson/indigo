@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 #
+# manage PDS crawled by relays
+#
 # pip install requests
 #
 # python3 copy_pdses.py --admin-key hunter2 --source-url http://srcrelay:2470 --dest-url http://destrelay:2470
 
+import csv
 import json
 import logging
 import sys
@@ -59,6 +62,15 @@ class relay:
         if self.block(host):
             logger.debug("requestCrawl + block %s OK", host)
 
+    def resync(self, host):
+        "host string"
+        url = urllib.parse.urljoin(self.rooturl, '/admin/pds/resync')
+        response = self.session.post(url, params={"host": host}, headers=self.headers, data='')
+        if response.status_code != 200:
+            sys.stderr.write(f"{url}?host={host} : ({response.status_code}) ({response.text!r})\n")
+        else:
+            sys.stderr.write(f"{url}?host={host} : OK\n")
+
     def block(self, host):
         url = urllib.parse.urljoin(self.rooturl, '/admin/pds/block')
         response = self.session.post(url, headers=self.headers, data='', params={"host":host})
@@ -83,6 +95,17 @@ class relay:
             logger.error("%s : %d %r", url, response.status_code, response.text)
             return None
         return response.json()
+
+# pds limits for POST /admin/pds/changeLimits
+# {"host":"", "per_second": int, "per_hour": int, "per_day": int, "crawl_rate": int, "repo_limit": int}
+
+limitsKeys = ('per_second', 'per_hour', 'per_day', 'crawl_rate', 'repo_limit')
+
+def checkLimits(limits):
+    for k in limits.keys():
+        if k not in limitsKeys:
+            raise Exception(f"unknown pds rate limits key {k!r}")
+    return True
 
 def fromtext(fin):
     for line in fin:
@@ -139,31 +162,18 @@ def de(a,b):
             return False
     return True
 
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--admin-key', default=None, help='relay auth bearer token', required=True)
-    ap.add_argument('--source-url', default=None, help='base url to GET /admin/pds/list')
-    ap.add_argument('--source-json', default=None, help='load /admin/pds/list json from file')
-    ap.add_argument('--except', dest='except_list', default=None, help='text or csv list of PDS host exceptions _not_ to propagate')
-    ap.add_argument('--dest-url', default=None, help='dest URL to POST requestCrawl etc to')
-    ap.add_argument('--dry-run', default=False, action='store_true')
-    ap.add_argument('--verbose', default=False, action='store_true')
-    args = ap.parse_args()
-
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
-
+def copy_pdses(args):
     headers = {'Authorization': 'Bearer ' + args.admin_key}
+    dest_url = args.dest_url or args.url
 
     if args.source_json:
         with open(args.source_json, 'rt') as fin:
             sourceList = json.load(fin)
+        print(f"copy {args.source_json!r} to {dest_url!r}")
     elif args.source_url:
         relaySession = relay(args.source_url, headers)
         sourceList = relaySession.pdsList()
+        print(f"copy {args.source_url!r} to {dest_url!r}")
     else:
         sys.stdout.write("need --source-url or --source-json\n")
         sys.exit(1)
@@ -248,8 +258,68 @@ def main():
     for k2 in dnots:
         logger.debug("%s", k2)
 
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--admin-key', default=None, help='relay auth bearer token', required=True)
+    ap.add_argument('--pdslist', default=None, help='hostname per line PDS list text')
+    ap.add_argument('--pds-csv', default=None, help='PDS list CSV in column "host" or "hostname"')
+    ap.add_argument('--source-url', default=None, help='base url to GET /admin/pds/list')
+    ap.add_argument('--source-json', default=None, help='load /admin/pds/list json from file')
+    ap.add_argument('--except', dest='except_list', default=None, help='text or csv list of PDS host exceptions _not_ to propagate')
+    ap.add_argument('--dest-url', default=None, help='dest URL to POST requestCrawl etc to')
+    ap.add_argument('--url', default=None, help='relay root URL')
+    ap.add_argument('--resync', default=False, action='store_true', help='resync selected PDSes')
+    ap.add_argument('--crawl', default=False, action='store_true', help='crawl & set limits')
+    ap.add_argument('--limits', default=None, help='json pds rate limits')
+    ap.add_argument('--block', default=False, action='store_true', help='block PDSes')
+    ap.add_argument('--dry-run', default=False, action='store_true')
+    ap.add_argument('--verbose', default=False, action='store_true')
+    args = ap.parse_args()
 
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
 
+    headers = {'Authorization': 'Bearer ' + args.admin_key}
+
+    if args.pdslist and args.pds_csv:
+        print("should have at most one of --pdslist and --pds-csv")
+        sys.exit(1)
+        return 1
+
+    if (args.source_json or args.source_url) and (args.dest_url or args.url):
+        copy_pdses(args)
+        return 0
+    else:
+        if (not args.url) and (not args.dest_url):
+            print(ap.usage())
+            sys.exit(1)
+
+    relaySession = relay(args.url or args.dest_url, headers)
+
+    limits = None
+    if args.limits:
+        limits = json.loads(args.limits)
+        checkLimits(limits)
+
+    if args.pdslist == '-':
+        source = fromtext(sys.stdin)
+    elif args.pdslist:
+        source = fromtext(open(args.pdslist, 'rt'))
+    elif args.pds_csv == '-':
+        source = fromcsv(sys.stdin)
+    elif args.pds_csv:
+        source = fromcsv(open(args.pds_csv, 'rt'))
+
+    for host in source:
+        if args.crawl:
+            relaySession.crawlAndSetLimits(host, limits)
+        elif args.resync:
+            relaySession.resync(host)
+        elif args.block:
+            relaySession.block(host)
 
 
 if __name__ == '__main__':
