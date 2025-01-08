@@ -30,6 +30,7 @@ class relay:
         url = urllib.parse.urljoin(self.rooturl, '/admin/pds/requestCrawl')
         response = self.session.post(url, headers=pheaders, data=json.dumps({"hostname": host}))
         if response.status_code != 200:
+            logger.error("%s %s : %d %r", url, host, response.status_code, response.text)
             return False
         return True
 
@@ -43,6 +44,7 @@ class relay:
         if self.setLimits(host, limits):
             logger.debug("requestCrawl + changeLimits %s OK", host)
     def setLimits(self, host, limits):
+        host = stripUrlScheme(host)
         url = urllib.parse.urljoin(self.rooturl, '/admin/pds/changeLimits')
         plimits = dict(limits)
         plimits["host"] = host
@@ -98,6 +100,12 @@ class relay:
 
 # pds limits for POST /admin/pds/changeLimits
 # {"host":"", "per_second": int, "per_hour": int, "per_day": int, "crawl_rate": int, "repo_limit": int}
+
+def stripUrlScheme(host):
+    for scheme in ('http://', 'https://', 'ws://', 'wss://'):
+        if host.startswith(scheme):
+            return host[len(scheme):]
+    return host
 
 limitsKeys = ('per_second', 'per_hour', 'per_day', 'crawl_rate', 'repo_limit')
 
