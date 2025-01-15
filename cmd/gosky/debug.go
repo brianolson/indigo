@@ -302,6 +302,9 @@ var compareStreamsCmd = &cli.Command{
 			Name:     "host2",
 			Required: true,
 		},
+		&cli.StringFlag{
+			Name: "expire-log",
+		},
 	},
 	ArgsUsage: `<cursor>`,
 	Action:    compareStreams,

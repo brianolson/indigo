@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/events"
@@ -11,9 +12,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/urfave/cli/v2"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -25,6 +28,7 @@ type compareStreamsSession struct {
 	spreadWindowedAverage durationWindowedAverage
 
 	matches uint64
+	expires chan ExpireRecord
 }
 
 func (ses *compareStreamsSession) printCurrentDelta(out io.Writer) (int, error) {
@@ -33,9 +37,10 @@ func (ses *compareStreamsSession) printCurrentDelta(out io.Writer) (int, error) 
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		fmt.Fprintf(&sb, "[%d] %d pending", i, stm.pendingCount)
+		fmt.Fprintf(&sb, "[%d] %d pending, %d expired", i, stm.pendingCount, stm.pendingExpired)
 	}
-	fmt.Fprintf(&sb, ", %d matched\n", ses.matches)
+	stats := ses.spreadWindowedAverage.stats()
+	fmt.Fprintf(&sb, ", %d matched (%s<%s<%s [%s])\n", ses.matches, stats.Min, stats.Mean, stats.Max, stats.Stddev)
 	return out.Write(sb.Bytes())
 }
 func (ses *compareStreamsSession) printDetailedDelta(out io.Writer) {
@@ -60,6 +65,9 @@ func (ses *compareStreamsSession) run(url1, url2 string) error {
 	}
 	logPeriod := time.Second
 	out := os.Stdout
+
+	cleanupPeriod := time.NewTicker(time.Minute)
+	defer cleanupPeriod.Stop()
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
@@ -87,6 +95,16 @@ func (ses *compareStreamsSession) run(url1, url2 string) error {
 				ses.spreadWindowedAverage.add(dt)
 				ses.matches++
 			}
+		case <-cleanupPeriod.C:
+			var wg sync.WaitGroup
+			now := time.Now()
+			for i := range ses.streams {
+				wg.Add(1)
+				go ses.streams[i].cleanup(&wg, now, i, ses.expires)
+			}
+			wg.Wait()
+			cleanupTime := time.Now().Sub(now)
+			fmt.Fprintf(out, "cleanup in %s\n", cleanupTime.String())
 		case <-ch:
 			// shutdown
 			ses.printDetailedDelta(out)
@@ -142,12 +160,52 @@ func (dwa *durationWindowedAverage) mean() time.Duration {
 	return dwa.sum / time.Duration(len(dwa.times))
 }
 
+type durationWindowedAverageStats struct {
+	Mean   time.Duration
+	Min    time.Duration
+	Max    time.Duration
+	Stddev time.Duration
+}
+
+func (dwa *durationWindowedAverage) stats() durationWindowedAverageStats {
+	mean := dwa.mean()
+	ssd := float64(0)
+	dtmin := dwa.times[0]
+	dtmax := dwa.times[0]
+	for _, dt := range dwa.times {
+		if dt < dtmin {
+			dtmin = dt
+		}
+		if dt > dtmax {
+			dtmax = dt
+		}
+		d := float64(dt - mean)
+		dd := d * d
+		ssd += dd
+	}
+	variance := ssd / float64(len(dwa.times))
+	stddev := math.Sqrt(variance)
+	return durationWindowedAverageStats{
+		Mean:   mean,
+		Min:    dtmin,
+		Max:    dtmax,
+		Stddev: time.Duration(stddev),
+	}
+}
+
 // just the bits we need from comatproto.SyncSubscribeRepos_Commit
 type minCommit struct {
-	Commit lexutil.LexLink  `json:"commit" cborgen:"commit"`
-	Prev   *lexutil.LexLink `json:"prev" cborgen:"prev"`
-	Repo   string           `json:"repo" cborgen:"repo"`
-	Seq    int64            `json:"seq" cborgen:"seq"`
+	Commit lexutil.LexLink  `json:"commit,omitempty" cborgen:"commit"`
+	Prev   *lexutil.LexLink `json:"prev,omitempty" cborgen:"prev"`
+	Repo   string           `json:"repo,omitempty" cborgen:"repo"`
+	Seq    int64            `json:"seq,omitempty" cborgen:"seq"`
+}
+
+type ExpireRecord struct {
+	Source     int    `json:"s"`
+	SourceName string `json:"sname,omitempty"`
+	Repo       string `json:"r,omitempty"`
+	CommitCid  string `json:"c,omitempty"`
 }
 
 func commitToMinCommit(evt *comatproto.SyncSubscribeRepos_Commit) minCommit {
@@ -166,12 +224,13 @@ type indexedEvent struct {
 }
 
 type compareStreamsStream struct {
-	url          string
-	n            int
-	pendingCount int
-	events       chan<- indexedEvent
-	buffer       map[string][]indexedEvent
-	count        uint64
+	url            string
+	n              int
+	pendingCount   int
+	pendingExpired int
+	events         chan<- indexedEvent
+	buffer         map[string][]indexedEvent
+	count          uint64
 }
 
 func newCompareStreamsStream(url string, n int, events chan<- indexedEvent) *compareStreamsStream {
@@ -210,6 +269,38 @@ func (cstream *compareStreamsStream) findMatchAndRemove(event indexedEvent) (fou
 	}
 
 	return false, 0, fmt.Errorf("did not find matching event despite having events in buffer")
+}
+
+func (cstream *compareStreamsStream) cleanup(wg *sync.WaitGroup, now time.Time, channelIndex int, expires chan<- ExpireRecord) {
+	defer wg.Done()
+	expired := now.Add(-5 * time.Minute)
+	//fmt.Printf("cleanup [%d]\n", channelIndex)
+	for repo, rbuf := range cstream.buffer {
+		outpos := 0
+		for pos := range rbuf {
+			if rbuf[pos].arrivedAt.Before(expired) {
+				if expires != nil {
+					expiredEvent := rbuf[pos].event
+					expriedSource := rbuf[pos].sourceId
+					expires <- ExpireRecord{
+						Source:    expriedSource,
+						CommitCid: expiredEvent.Commit.String(),
+						Repo:      expiredEvent.Repo,
+					}
+				}
+				cstream.pendingExpired++
+				// discard rbuf[pos], outpos does not advance, compact over it
+			} else {
+				if pos != outpos {
+					rbuf[outpos] = rbuf[pos]
+				}
+				outpos++
+			}
+		}
+		if outpos < len(rbuf) {
+			cstream.buffer[repo] = rbuf[:outpos]
+		}
+	}
 }
 
 func (cstream *compareStreamsStream) add(event indexedEvent) {
@@ -255,13 +346,42 @@ func llpEq(a, b *lexutil.LexLink) bool {
 	return *a == *b
 }
 
+func expireWriter(expires chan ExpireRecord, fout io.WriteCloser) {
+	defer fout.Close()
+	enc := json.NewEncoder(fout)
+	for rec := range expires {
+		err := enc.Encode(rec)
+		if err != nil {
+			panic(fmt.Sprintf("json enc err, %s", err))
+		}
+	}
+}
+
 func compareStreams(cctx *cli.Context) error {
 	h1 := cctx.String("host1")
 	h2 := cctx.String("host2")
+	expireLog := cctx.String("expire-log")
 
 	url1 := fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", h1)
 	url2 := fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos", h2)
 
 	var ses compareStreamsSession
+	if expireLog != "" {
+		fout, err := os.Create(expireLog)
+		if err != nil {
+			return err
+		}
+		ses.expires = make(chan ExpireRecord, 100)
+		go expireWriter(ses.expires, fout)
+		ses.expires <- ExpireRecord{
+			Source:     0,
+			SourceName: h1,
+		}
+		ses.expires <- ExpireRecord{
+			Source:     1,
+			SourceName: h2,
+		}
+		defer close(ses.expires)
+	}
 	return ses.run(url1, url2)
 }
