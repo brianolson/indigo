@@ -208,6 +208,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Repo, &XRPCStreamEvent{
+					Header:     header,
 					RepoCommit: &evt,
 				}); err != nil {
 					return err
@@ -224,6 +225,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					Header:     header,
 					RepoHandle: &evt,
 				}); err != nil {
 					return err
@@ -240,6 +242,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					Header:       header,
 					RepoIdentity: &evt,
 				}); err != nil {
 					return err
@@ -256,6 +259,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					Header:      header,
 					RepoAccount: &evt,
 				}); err != nil {
 					return err
@@ -268,6 +272,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				}
 
 				if err := sched.AddWork(ctx, "", &XRPCStreamEvent{
+					Header:   header,
 					RepoInfo: &evt,
 				}); err != nil {
 					return err
@@ -284,6 +289,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					Header:      header,
 					RepoMigrate: &evt,
 				}); err != nil {
 					return err
@@ -300,6 +306,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					Header:        header,
 					RepoTombstone: &evt,
 				}); err != nil {
 					return err
@@ -317,6 +324,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, "", &XRPCStreamEvent{
+					Header:      header,
 					LabelLabels: &evt,
 				}); err != nil {
 					return err
@@ -330,7 +338,8 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 			}
 
 			if err := sched.AddWork(ctx, "", &XRPCStreamEvent{
-				Error: &errframe,
+				Header: header,
+				Error:  &errframe,
 			}); err != nil {
 				return err
 			}

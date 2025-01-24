@@ -376,6 +376,15 @@ func (s *Splitter) HandleComAtprotoSyncListRepos(c echo.Context) error {
 	return c.JSON(200, out)
 }
 
+func truthy(x string) bool {
+	x = strings.ToLower(x)
+	switch x {
+	case "t", "true", "1":
+		return true
+	default:
+		return false
+	}
+}
 func (s *Splitter) EventsHandler(c echo.Context) error {
 	var since *int64
 	if sinceVal := c.QueryParam("cursor"); sinceVal != "" {
@@ -384,6 +393,10 @@ func (s *Splitter) EventsHandler(c echo.Context) error {
 			return err
 		}
 		since = &sval
+	}
+	nudgeMode := truthy(c.QueryParam("nudge"))
+	if nudgeMode {
+		s.log.Info("nudge enabled")
 	}
 
 	ctx, cancel := context.WithCancel(c.Request().Context())
@@ -479,11 +492,47 @@ func (s *Splitter) EventsHandler(c echo.Context) error {
 	defer activeClientGauge.Dec()
 
 	for {
+	nextselect:
 		select {
 		case evt, ok := <-evts:
 			if !ok {
 				s.log.Error("event stream closed unexpectedly")
 				return nil
+			}
+			var nudgeBlob []byte
+			if nudgeMode {
+				// do nudgeMode stuff here because sometime we drop the message and don't do conn.NextWriter()
+				if evt.Header.Op == events.EvtKindErrorFrame {
+					// send nothing to nudge stream
+					s.log.Info("nudge err")
+					goto nextselect
+				} else if evt.Header.Op == events.EvtKindMessage {
+					seq, hasSeq := evt.GetSequence()
+					repo, hasRepo := evt.GetRepo()
+					if hasSeq || hasRepo {
+						// message is worth sending
+						//var nmsg NudgeMessage
+						out := make(map[string]any, 9)
+						out["k"] = evt.Header.MsgType
+						if hasSeq {
+							out["seq"] = seq
+						}
+						if hasRepo {
+							out["repo"] = repo
+						}
+						nudgeBlob, err = json.Marshal(out)
+						if err != nil {
+							return fmt.Errorf("nudge json: %w", err)
+						}
+						s.log.Info("nudge message", "msg", out, "bloblen", len(nudgeBlob))
+					} else {
+						s.log.Info("nudge empty")
+						goto nextselect
+					}
+				} else {
+					s.log.Info("evt.Header", "op", evt.Header.Op)
+					goto nextselect
+				}
 			}
 
 			wc, err := conn.NextWriter(websocket.BinaryMessage)
@@ -492,7 +541,16 @@ func (s *Splitter) EventsHandler(c echo.Context) error {
 				return err
 			}
 
-			if evt.Preserialized != nil {
+			if nudgeMode {
+				if nudgeBlob == nil {
+					panic("nil nudgeblob")
+				}
+				s.log.Info("nudge blob", "len", len(nudgeBlob))
+				_, err = wc.Write(nudgeBlob)
+				if err != nil {
+					return fmt.Errorf("nudge write: %w", err)
+				}
+			} else if evt.Preserialized != nil {
 				_, err = wc.Write(evt.Preserialized)
 			} else {
 				err = evt.Serialize(wc)
