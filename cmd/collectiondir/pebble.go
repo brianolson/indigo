@@ -74,6 +74,7 @@ type PebbleCollectionDirectory struct {
 
 	// collections can be LRU cache if it ever becomes too big
 	collections     map[string]uint32
+	collectionNames map[uint32]string // TODO: B-tree would be nice
 	maxCollectionId uint32
 
 	log *slog.Logger
@@ -86,6 +87,7 @@ func (pcd *PebbleCollectionDirectory) Open(pebblePath string) error {
 	}
 	pcd.db = db
 	pcd.collections = make(map[string]uint32)
+	pcd.collectionNames = make(map[uint32]string)
 	if pcd.log == nil {
 		pcd.log = slog.Default()
 	}
@@ -126,11 +128,53 @@ func (pcd *PebbleCollectionDirectory) ReadAllCollectionInterns(ctx context.Conte
 		collectionId := binary.BigEndian.Uint32(value)
 		count++
 		pcd.collections[collection] = collectionId
+		pcd.collectionNames[collectionId] = collection
 		if collectionId > pcd.maxCollectionId {
 			pcd.maxCollectionId = collectionId
 		}
+		pcd.log.Debug("collection", "name", collection, "id", collectionId)
 	}
 	pcd.log.Debug("read collections", "count", count, "max", pcd.maxCollectionId)
+	return nil
+}
+
+type CollectionDidTime struct {
+	Collection string
+	Did        string
+	UnixMillis int64
+}
+
+func (pcd *PebbleCollectionDirectory) ReadAllPrimary(ctx context.Context, out chan<- CollectionDidTime) error {
+	defer close(out)
+	lower := []byte{'A'}
+	upper := []byte{'B'}
+	iter, err := pcd.db.NewIterWithContext(ctx, &pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return fmt.Errorf("collection iter start, %w", err)
+	}
+	defer iter.Close()
+	count := 0
+	done := ctx.Done()
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		collectionId, did, seenMs := parsePrimaryPebbleRow(key)
+		count++
+		collection := pcd.collectionNames[collectionId]
+		rec := CollectionDidTime{
+			Collection: collection,
+			Did:        did,
+			UnixMillis: seenMs,
+		}
+		select {
+		case <-done:
+			return nil
+		case out <- rec:
+		}
+	}
+	pcd.log.Debug("read primary", "count", count)
 	return nil
 }
 
@@ -159,6 +203,7 @@ func (pcd *PebbleCollectionDirectory) CollectionToId(collection string) (uint32,
 		return 0, fmt.Errorf("pebble get err, %w", err)
 	}
 	collectionId = pcd.maxCollectionId + 1
+	pcd.maxCollectionId = collectionId
 	var cib [4]byte
 	binary.BigEndian.PutUint32(cib[:], collectionId)
 	err = pcd.db.Set(key, cib[:], pebble.NoSync)
@@ -166,6 +211,7 @@ func (pcd *PebbleCollectionDirectory) CollectionToId(collection string) (uint32,
 		return 0, fmt.Errorf("pebble set err, %w", err)
 	}
 	pcd.collections[collection] = collectionId
+	pcd.collectionNames[collectionId] = collection
 	return collectionId, nil
 }
 
@@ -221,4 +267,22 @@ func (pcd *PebbleCollectionDirectory) SetFromResults(results <-chan DidCollectio
 			errcount = 0
 		}
 	}
+}
+
+type CollectionStats struct {
+	CollectionCounts map[string]uint64 `json:"collections"`
+}
+
+func (pcd *PebbleCollectionDirectory) GetCollectionStats() (stats CollectionStats, err error) {
+	ctx := context.Background()
+	records := make(chan CollectionDidTime, 1000)
+	go pcd.ReadAllPrimary(ctx, records)
+
+	stats.CollectionCounts = make(map[string]uint64)
+
+	for rec := range records {
+		stats.CollectionCounts[rec.Collection]++
+	}
+
+	return stats, nil
 }

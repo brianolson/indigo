@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/carlmjohnson/versioninfo"
@@ -27,6 +28,7 @@ func main() {
 			serveCmd,
 			crawlCmd,
 			buildCmd,
+			statsCmd,
 		},
 	}
 	err := app.Run(os.Args)
@@ -40,6 +42,42 @@ var serveCmd = &cli.Command{
 	Name:  "serve",
 	Flags: []cli.Flag{},
 	Action: func(ctx *cli.Context) error {
+		return nil
+	},
+}
+
+var statsCmd = &cli.Command{
+	Name: "stats",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:     "pebble",
+			Usage:    "path to store pebble db",
+			Required: true,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		logLevel := slog.LevelInfo
+		if cctx.Bool("verbose") {
+			logLevel = slog.LevelDebug
+		}
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
+		slog.SetDefault(log)
+		pebblePath := cctx.String("pebble")
+		var db PebbleCollectionDirectory
+		db.log = log
+		err := db.Open(pebblePath)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+
+		stats, err := db.GetCollectionStats()
+		if err != nil {
+			return err
+		}
+		blob, err := json.MarshalIndent(stats, "", "  ")
+		os.Stdout.Write(blob)
+		os.Stdout.Write([]byte{'\n'})
 		return nil
 	},
 }
@@ -98,6 +136,7 @@ var buildCmd = &cli.Command{
 			fin = osin
 		}
 		reader := csv.NewReader(fin)
+		rowcount := 0
 		results := make(chan DidCollection, 100)
 		go db.SetFromResults(results)
 		for {
@@ -111,8 +150,10 @@ var buildCmd = &cli.Command{
 				Did:        did,
 				Collection: collection,
 			}
+			rowcount++
 		}
 		close(results)
+		log.Debug("read csv", "rows", rowcount)
 		return nil
 	},
 }
