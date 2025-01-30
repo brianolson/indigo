@@ -38,14 +38,6 @@ func main() {
 	}
 }
 
-var serveCmd = &cli.Command{
-	Name:  "serve",
-	Flags: []cli.Flag{},
-	Action: func(ctx *cli.Context) error {
-		return nil
-	},
-}
-
 var statsCmd = &cli.Command{
 	Name: "stats",
 	Flags: []cli.Flag{

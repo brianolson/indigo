@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ func makeCollectionInternKey(collection string) []byte {
 
 func parseCollectionInternKey(key []byte) string {
 	if key[0] != 'C' {
-		panic(fmt.Sprintf("collection key must start with C, got %r", key[0]))
+		panic(fmt.Sprintf("collection key must start with C, got %v", key[0]))
 	}
 	return string(key[1:])
 }
@@ -37,7 +38,7 @@ func makePrimaryPebbleRow(collection uint32, did string, seenMs int64) []byte {
 
 func parsePrimaryPebbleRow(row []byte) (collectionId uint32, did string, seenMs int64) {
 	if row[0] != 'A' {
-		panic(fmt.Sprintf("primary row key wanted A got %r", row[0]))
+		panic(fmt.Sprintf("primary row key wanted A got %v", row[0]))
 	}
 	collectionId = binary.BigEndian.Uint32(row[1:5])
 	seenMs = int64(binary.BigEndian.Uint64(row[5:13]))
@@ -48,7 +49,7 @@ func parsePrimaryPebbleRow(row []byte) (collectionId uint32, did string, seenMs 
 func makeByDidKey(did string, collectionId uint32) []byte {
 	out := make([]byte, 1+len(did)+4)
 	out[0] = 'D'
-	copy(out[1:1+len(did)], []byte(did))
+	copy(out[1:1+len(did)], did)
 	pos := 1 + len(did)
 	binary.BigEndian.PutUint32(out[pos:], collectionId)
 	return out
@@ -56,7 +57,7 @@ func makeByDidKey(did string, collectionId uint32) []byte {
 
 func parseByDidKey(key []byte) (did string, collectionId uint32) {
 	if key[0] != 'D' {
-		panic(fmt.Sprintf("by did key wanted D got %r", key[0]))
+		panic(fmt.Sprintf("by did key wanted D got %v", key[0]))
 	}
 	last4 := len(key) - 5
 	collectionId = binary.BigEndian.Uint32(key[last4:])
@@ -64,6 +65,7 @@ func parseByDidKey(key []byte) (did string, collectionId uint32) {
 	return did, collectionId
 }
 
+// PebbleCollectionDirectory holds a DID<=>{collections} directory in pebble db.
 // The primary database is (collection, seen time int64 milliseconds, did)
 // Inner schema:
 // C{collection} : {uint32 collectionId}
@@ -178,6 +180,69 @@ func (pcd *PebbleCollectionDirectory) ReadAllPrimary(ctx context.Context, out ch
 	return nil
 }
 
+func (pcd *PebbleCollectionDirectory) ReadCollection(ctx context.Context, collection, cursor string, limit int) (result []CollectionDidTime, nextCursor string, err error) {
+	var lower []byte
+	collectionId, err := pcd.CollectionToId(collection)
+	if err != nil {
+		return nil, "", fmt.Errorf("collection id err, %w", err)
+	}
+	if cursor != "" {
+		lower, err = base64.StdEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("could not decode cursor, %w", err)
+		}
+	} else {
+		lower := make([]byte, 1+4)
+		lower[0] = 'A'
+		binary.BigEndian.PutUint32(lower[1:], collectionId)
+	}
+	var upper [5]byte
+	upper[0] = 'A'
+	binary.BigEndian.PutUint32(upper[1:], collectionId+1)
+	iter, err := pcd.db.NewIterWithContext(ctx, &pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper[:],
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("collection iter start, %w", err)
+	}
+	defer iter.Close()
+	count := 0
+	done := ctx.Done()
+	result = make([]CollectionDidTime, 0, limit)
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		collectionId, did, seenMs := parsePrimaryPebbleRow(key)
+		count++
+		collection := pcd.collectionNames[collectionId]
+		rec := CollectionDidTime{
+			Collection: collection,
+			Did:        did,
+			UnixMillis: seenMs,
+		}
+		result = append(result, rec)
+		breaker := false
+		if count >= limit {
+			breaker = true
+		} else {
+			select {
+			case <-done:
+				breaker = true
+			default:
+			}
+		}
+		if breaker {
+			prevKey := make([]byte, len(key), len(key)+1)
+			copy(prevKey, key)
+			prevKey = append(prevKey, 0)
+			nextCursor = base64.StdEncoding.EncodeToString(prevKey)
+			break
+		}
+	}
+	pcd.log.Debug("read primary", "count", count)
+	return result, nextCursor, nil
+}
+
 func (pcd *PebbleCollectionDirectory) CollectionToId(collection string) (uint32, error) {
 	// easy mode: in cache
 	collectionId, ok := pcd.collections[collection]
@@ -215,7 +280,7 @@ func (pcd *PebbleCollectionDirectory) CollectionToId(collection string) (uint32,
 	return collectionId, nil
 }
 
-var trueValue [1]byte = [1]byte{'t'}
+var trueValue = [1]byte{'t'}
 
 func (pcd *PebbleCollectionDirectory) MaybeSetCollection(did, collection string) error {
 	collectionId, err := pcd.CollectionToId(collection)

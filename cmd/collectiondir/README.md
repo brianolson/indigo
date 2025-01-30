@@ -14,8 +14,8 @@ The primary query is:
 
 It returns JSON:
 
-```js
-{"dids":["did:A", ...],
+```json
+{"dids":["did:A", "..."],
 "cursor":"opaque text"}
 ```
 
@@ -35,8 +35,8 @@ If multiple collections are specified, the result stream is not guaranteed to be
 With no `c` parameter it returns all known collections with cursor paging.
 With up to 20 repeated `c` paramaters it returns only those collections (no paging).
 It may be the cached result of a computation, up to several minutes out of date.
-```js
-{"collections":{"app.bsky.feed.post": 123456789, ...},
+```json
+{"collections":{"app.bsky.feed.post": 123456789, "some collection": 42},
 "cursor":"opaque text"}
 ```
 

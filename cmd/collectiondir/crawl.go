@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"github.com/labstack/gommon/log"
+	"golang.org/x/time/rate"
 	"io"
 	"log/slog"
 	"net/http"
@@ -43,6 +45,11 @@ var crawlCmd = &cli.Command{
 		&cli.StringFlag{
 			Name:  "csv-out",
 			Usage: "path for output or - for stdout",
+		},
+		&cli.Float64Flag{
+			Name:  "qps",
+			Usage: "queries per second to do vs target PDS",
+			Value: 50, // large PDS: 500_000 repos, 10_000 seconds, ~3 hours
 		},
 		&cli.StringFlag{
 			Name:    "ratelimit-header",
@@ -84,36 +91,47 @@ var crawlCmd = &cli.Command{
 				}
 			}
 		}
+		qps := cctx.Float64("qps")
 		results := make(chan DidCollection, 100)
 		defer close(results)
 		go DidCollectionsToCsv(fout, results)
-		var cursor string
-		for true {
-			repos, err := atproto.SyncListRepos(ctx, &rpcClient, cursor, 1000)
-			if err != nil {
-				// TODO: wait N seconds, retry M times
-				return fmt.Errorf("%s: sync repos: %w", hostname, err)
-			}
-			log.Info("got repo list", "count", len(repos.Repos))
-			for _, xr := range repos.Repos {
-				// TODO: rate limit
-				desc, err := atproto.RepoDescribeRepo(ctx, &rpcClient, xr.Did)
-				if err != nil {
-					log.Error("repo desc", "host", hostname, "did", xr.Did, "err", err)
-					continue
-				}
-				for _, collection := range desc.Collections {
-					results <- DidCollection{Did: xr.Did, Collection: collection}
-				}
-			}
-			if repos.Cursor != nil {
-				cursor = *repos.Cursor
-			} else {
-				break
-			}
-		}
+		err = CrawlPDSRepoCollections(ctx, &rpcClient, qps, results)
 		log.Info("done")
 
-		return nil
+		return err
 	},
+}
+
+// write results to chan
+// does _not_ close chan
+// (allow multiple threads of PDS queries running to one output chan, e.g. feeding into SetFromResults() )
+func CrawlPDSRepoCollections(ctx context.Context, rpcClient *xrpc.Client, qps float64, results chan<- DidCollection) error {
+	var cursor string
+	limiter := rate.NewLimiter(rate.Limit(qps), 1)
+	for {
+		limiter.Wait(ctx)
+		repos, err := atproto.SyncListRepos(ctx, rpcClient, cursor, 1000)
+		if err != nil {
+			// TODO: wait N seconds, retry M times
+			return fmt.Errorf("%s: sync repos: %w", rpcClient.Host, err)
+		}
+		log.Info("got repo list", "count", len(repos.Repos))
+		for _, xr := range repos.Repos {
+			limiter.Wait(ctx)
+			desc, err := atproto.RepoDescribeRepo(ctx, rpcClient, xr.Did)
+			if err != nil {
+				log.Error("repo desc", "host", rpcClient.Host, "did", xr.Did, "err", err)
+				continue
+			}
+			for _, collection := range desc.Collections {
+				results <- DidCollection{Did: xr.Did, Collection: collection}
+			}
+		}
+		if repos.Cursor != nil {
+			cursor = *repos.Cursor
+		} else {
+			break
+		}
+	}
+	return nil
 }
