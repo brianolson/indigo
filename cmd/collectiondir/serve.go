@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/urfave/cli/v2"
@@ -27,6 +28,11 @@ var serveCmd = &cli.Command{
 			Value:   ":2511",
 			EnvVars: []string{"RAINBOW_METRICS_LISTEN", "SPLITTER_METRICS_LISTEN"},
 		},
+		&cli.StringFlag{
+			Name:     "pebble",
+			Usage:    "path to store pebble db",
+			Required: true,
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		var server collectionServer
@@ -45,8 +51,20 @@ type collectionServer struct {
 }
 
 func (cs *collectionServer) run(cctx *cli.Context) error {
+	pebblePath := cctx.String("pebble")
+	cs.pcd = &PebbleCollectionDirectory{}
+	err := cs.pcd.Open(pebblePath)
+	if err != nil {
+		return fmt.Errorf("%s: failed to open pebble db: %w", pebblePath, err)
+	}
 	cs.statsCacheFresh.L = &cs.statsCacheLock
-	return nil
+	errchan := make(chan error, 3)
+	apiAddr := cctx.String("api-listen")
+	go func() {
+		errchan <- cs.StartApiServer(cctx.Context, apiAddr)
+	}()
+	// TODO run metrics
+	return <-errchan
 }
 
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
