@@ -15,6 +15,10 @@ var firehoseReceivedCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "number of events received from upstream firehose",
 })
 
+var pdsCrawledCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "collectiondir_pds_crawled_total",
+})
+
 var reqDur = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "http_request_duration_seconds",
 	Help:    "A histogram of latencies for requests.",

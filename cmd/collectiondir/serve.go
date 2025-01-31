@@ -117,6 +117,9 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 		cs.ratelimitHeader = cctx.String("ratelimit-header")
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	cs.ingest = make(chan DidCollection, 1000)
+	cs.wg.Add(1)
+	go cs.ingestReceiver()
 	cs.log = log
 	cs.ctx = cctx.Context
 	cs.AdminToken = cctx.String("admin-token")
@@ -130,10 +133,12 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 	cs.statsCacheFresh.L = &cs.statsCacheLock
 	errchan := make(chan error, 3)
 	apiAddr := cctx.String("api-listen")
+	cs.wg.Add(1)
 	go func() {
 		errchan <- cs.StartApiServer(cctx.Context, apiAddr)
 	}()
 	metricsAddr := cctx.String("api-listen")
+	cs.wg.Add(1)
 	go func() {
 		errchan <- cs.StartMetricsServer(cctx.Context, metricsAddr)
 	}()
@@ -152,7 +157,9 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 			fh.Seq = seq
 		}
 		fhevents := make(chan *events.XRPCStreamEvent, 1000)
+		cs.wg.Add(1)
 		go cs.firehoseThread(&fh, fhevents)
+		cs.wg.Add(1)
 		go cs.handleFirehose(fhevents)
 	}
 
@@ -182,7 +189,6 @@ func (cs *collectionServer) Shutdown() error {
 }
 
 func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events.XRPCStreamEvent) {
-	cs.wg.Add(1)
 	defer cs.wg.Done()
 	ctx, cancel := context.WithCancel(cs.ctx)
 	go func() {
@@ -202,7 +208,6 @@ func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events
 }
 
 func (cs *collectionServer) handleFirehose(fhevents <-chan *events.XRPCStreamEvent) {
-	cs.wg.Add(1)
 	defer cs.wg.Done()
 	var lastSeq int64
 	for {
@@ -241,7 +246,6 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 }
 
 func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string) error {
-	cs.wg.Add(1)
 	defer cs.wg.Done()
 	cs.metricsServer = &http.Server{
 		Addr:    addr,
@@ -251,7 +255,6 @@ func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string)
 }
 
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
-	cs.wg.Add(1)
 	defer cs.wg.Done()
 	var lc net.ListenConfig
 	li, err := lc.Listen(ctx, "tcp", addr)
@@ -482,6 +485,7 @@ type ListCollectionsResponse struct {
 }
 
 func (cs *collectionServer) ingestReceiver() {
+	defer cs.wg.Done()
 	cs.pcd.SetFromResults(cs.ingest)
 }
 
@@ -563,10 +567,14 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 		Log:       cs.log,
 	}
 	start := time.Now()
-	cs.recordCrawlStart(host, start)
+	ok := cs.recordCrawlStart(host, start)
+	if !ok {
+		cs.log.Info("not crawling dup", "host", host)
+	}
 	cs.log.Info("crawling", "host", host)
 	err := crawler.CrawlPDSRepoCollections()
 	cs.clearActiveCrawl(host)
+	pdsCrawledCounter.Inc()
 	if err != nil {
 		cs.log.Warn("crawl err", "host", host, "err", err)
 	} else {
@@ -575,13 +583,22 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 	}
 }
 
-func (cs *collectionServer) recordCrawlStart(host string, start time.Time) {
+// recordCrawlStart returns true if ok, false if duplicate
+func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok bool) {
 	cs.activeCrawlsLock.Lock()
 	defer cs.activeCrawlsLock.Unlock()
 	if cs.activeCrawlHosts == nil {
 		cs.activeCrawlHosts = make(map[string]time.Time)
+		cs.activeCrawlHosts[host] = start
+		return true
+	} else {
+		_, dup := cs.activeCrawlHosts[host]
+		if dup {
+			return false
+		}
+		cs.activeCrawlHosts[host] = start
+		return true
 	}
-	cs.activeCrawlHosts[host] = start
 }
 
 func (cs *collectionServer) clearActiveCrawl(host string) {
