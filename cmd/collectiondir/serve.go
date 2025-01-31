@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	comatproto "github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,6 +38,11 @@ var serveCmd = &cli.Command{
 			Name:     "pebble",
 			Usage:    "path to store pebble db",
 			Required: true,
+		},
+		&cli.StringFlag{
+			Name:    "upstream",
+			Usage:   "URL, e.g. wss://bsky.network",
+			EnvVars: []string{"COLLECTIONS_UPSTREAM"},
 		},
 		&cli.StringFlag{
 			Name:    "admin-token",
@@ -103,7 +111,45 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 		errchan <- cs.StartApiServer(cctx.Context, apiAddr)
 	}()
 	// TODO run metrics
+
+	upstream := cctx.String("upstream")
+	if upstream != "" {
+		fh := Firehose{
+			Log:  log,
+			Host: upstream,
+			Seq:  -1, // TODO: persist sequence
+		}
+		events := make(chan *events.XRPCStreamEvent, 1000)
+		go fh.subscribeWithRedialer(cctx.Context, events)
+	}
+
 	return <-errchan
+}
+
+func (cs *collectionServer) handleFirehose(events <-chan *events.XRPCStreamEvent) {
+	for evt := range events {
+		if evt.RepoCommit != nil {
+			cs.handleCommit(evt.RepoCommit)
+		}
+	}
+}
+
+func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_Commit) {
+	for _, op := range commit.Ops {
+		// op.Path is collection/rkey
+		slash := strings.IndexRune(op.Path, '/')
+		if slash == -1 {
+			cs.log.Warn("bad op path", "repo", commit.Repo)
+			return
+		}
+		collection := op.Path[:slash]
+		if op.Action == "commit" || op.Action == "update" {
+			cs.ingest <- DidCollection{
+				Did:        commit.Repo,
+				Collection: collection,
+			}
+		}
+	}
 }
 
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
