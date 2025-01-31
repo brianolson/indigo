@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"github.com/labstack/gommon/log"
 	"golang.org/x/time/rate"
 	"io"
 	"log/slog"
@@ -95,36 +94,51 @@ var crawlCmd = &cli.Command{
 		results := make(chan DidCollection, 100)
 		defer close(results)
 		go DidCollectionsToCsv(fout, results)
-		err = CrawlPDSRepoCollections(ctx, &rpcClient, qps, results)
+		crawler := Crawler{
+			Ctx:       ctx,
+			RpcClient: &rpcClient,
+			QPS:       qps,
+			Results:   results,
+			Log:       log,
+		}
+		err = crawler.CrawlPDSRepoCollections()
 		log.Info("done")
 
 		return err
 	},
 }
 
+type Crawler struct {
+	Ctx       context.Context
+	RpcClient *xrpc.Client
+	QPS       float64
+	Results   chan<- DidCollection
+	Log       *slog.Logger
+}
+
 // write results to chan
 // does _not_ close chan
 // (allow multiple threads of PDS queries running to one output chan, e.g. feeding into SetFromResults() )
-func CrawlPDSRepoCollections(ctx context.Context, rpcClient *xrpc.Client, qps float64, results chan<- DidCollection) error {
+func (cr *Crawler) CrawlPDSRepoCollections() error {
 	var cursor string
-	limiter := rate.NewLimiter(rate.Limit(qps), 1)
+	limiter := rate.NewLimiter(rate.Limit(cr.QPS), 1)
 	for {
-		limiter.Wait(ctx)
-		repos, err := atproto.SyncListRepos(ctx, rpcClient, cursor, 1000)
+		limiter.Wait(cr.Ctx)
+		repos, err := atproto.SyncListRepos(cr.Ctx, cr.RpcClient, cursor, 1000)
 		if err != nil {
 			// TODO: wait N seconds, retry M times
-			return fmt.Errorf("%s: sync repos: %w", rpcClient.Host, err)
+			return fmt.Errorf("%s: sync repos: %w", cr.RpcClient.Host, err)
 		}
-		log.Info("got repo list", "count", len(repos.Repos))
+		slog.Info("got repo list", "count", len(repos.Repos))
 		for _, xr := range repos.Repos {
-			limiter.Wait(ctx)
-			desc, err := atproto.RepoDescribeRepo(ctx, rpcClient, xr.Did)
+			limiter.Wait(cr.Ctx)
+			desc, err := atproto.RepoDescribeRepo(cr.Ctx, cr.RpcClient, xr.Did)
 			if err != nil {
-				log.Error("repo desc", "host", rpcClient.Host, "did", xr.Did, "err", err)
+				slog.Error("repo desc", "host", cr.RpcClient.Host, "did", xr.Did, "err", err)
 				continue
 			}
 			for _, collection := range desc.Collections {
-				results <- DidCollection{Did: xr.Did, Collection: collection}
+				cr.Results <- DidCollection{Did: xr.Did, Collection: collection}
 			}
 		}
 		if repos.Cursor != nil {

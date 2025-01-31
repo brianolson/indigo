@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/urfave/cli/v2"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -21,17 +24,30 @@ var serveCmd = &cli.Command{
 		&cli.StringFlag{
 			Name:    "api-listen",
 			Value:   ":2510",
-			EnvVars: []string{"RAINBOW_API_LISTEN"},
+			EnvVars: []string{"COLLECTIONS_API_LISTEN"},
 		},
 		&cli.StringFlag{
 			Name:    "metrics-listen",
 			Value:   ":2511",
-			EnvVars: []string{"RAINBOW_METRICS_LISTEN", "SPLITTER_METRICS_LISTEN"},
+			EnvVars: []string{"COLLECTIONS_METRICS_LISTEN"},
 		},
 		&cli.StringFlag{
 			Name:     "pebble",
 			Usage:    "path to store pebble db",
 			Required: true,
+		},
+		&cli.StringFlag{
+			Name:    "admin-token",
+			Usage:   "admin authentication",
+			EnvVars: []string{"COLLECTIONS_ADMIN_TOKEN"},
+		},
+		&cli.Float64Flag{
+			Name:  "crawl-qps",
+			Usage: "per-PDS crawl queries-per-second limit",
+			Value: 100,
+		},
+		&cli.BoolFlag{
+			Name: "verbose",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -42,15 +58,38 @@ var serveCmd = &cli.Command{
 
 type collectionServer struct {
 	pcd *PebbleCollectionDirectory
+	ctx context.Context
 
 	statsCache        *CollectionStats
 	statsCacheWhen    time.Time
 	statsCacheLock    sync.Mutex
 	statsCacheFresh   sync.Cond
 	statsCachePending bool
+
+	ingest chan DidCollection
+
+	log *slog.Logger
+
+	AdminToken         string
+	ExepctedAuthHeader string
+	PerPDSCrawlQPS     float64
+
+	activeCrawlHosts map[string]time.Time
+	activeCrawlsLock sync.Mutex
 }
 
+const defaultPerPDSCrawlQPS = 100
+
 func (cs *collectionServer) run(cctx *cli.Context) error {
+	level := slog.LevelInfo
+	if cctx.Bool("verbose") {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	cs.log = log
+	cs.ctx = cctx.Context
+	cs.AdminToken = cctx.String("admin-token")
+	cs.ExepctedAuthHeader = "Bearer " + cs.AdminToken
 	pebblePath := cctx.String("pebble")
 	cs.pcd = &PebbleCollectionDirectory{}
 	err := cs.pcd.Open(pebblePath)
@@ -83,6 +122,10 @@ func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) err
 
 	e.GET("/v1/getDidsForCollection", cs.getDidsForCollection)
 	e.GET("/v1/listCollections", cs.listCollections)
+
+	// admin auth heador required
+	e.POST("/v1/crawlRequest", cs.crawlPds)
+	e.GET("/v1/crawlStatus", cs.crawlStatus)
 
 	e.Listener = li
 	srv := &http.Server{}
@@ -283,4 +326,131 @@ func (cs *collectionServer) listCollections(c echo.Context) error {
 type ListCollectionsResponse struct {
 	Collections map[string]uint64 `json:"collections"`
 	Cursor      string            `json:"cursor"`
+}
+
+func (cs *collectionServer) ingestReceiver() {
+	cs.pcd.SetFromResults(cs.ingest)
+}
+
+type CrawlRequest struct {
+	Host  string   `json:"host,omitempty"`
+	Hosts []string `json:"hosts,omitempty"`
+}
+
+type CrawlRequestResponse struct {
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func hostOrUrlToUrl(host string) string {
+	xu, err := url.Parse(host)
+	if err != nil {
+		xu = new(url.URL)
+		xu.Host = host
+		xu.Scheme = "https"
+		return xu.String()
+	} else if xu.Scheme == "" {
+		xu.Scheme = "https"
+		return xu.String()
+	}
+	return host
+}
+
+// /v1/crawlRequest
+// requires header `Authorization: Bearer {admin token}`
+//
+// POST {"host":"one hostname or URL", "hosts":["up to 1000 hosts", "..."]}
+// OR
+// POST /v1/crawlRequest?host={one host}
+func (cs *collectionServer) crawlPds(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+	if authHeader != cs.ExepctedAuthHeader {
+		return c.JSON(http.StatusForbidden, CrawlRequestResponse{Error: "nope"})
+	}
+	hostQ := c.QueryParam("host")
+	if hostQ != "" {
+		go cs.crawlThread(hostQ)
+		return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
+	}
+
+	var req CrawlRequest
+	err := c.Bind(&req)
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
+	if req.Host != "" {
+		go cs.crawlThread(req.Host)
+	}
+	for _, host := range req.Hosts {
+		go cs.crawlThread(host)
+	}
+	return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
+}
+
+func (cs *collectionServer) crawlThread(hostIn string) {
+	host := hostOrUrlToUrl(hostIn)
+	if host != hostIn {
+		cs.log.Info("going to crawl", "in", hostIn, "as", host)
+	}
+	httpClient := http.Client{}
+	rpcClient := xrpc.Client{
+		Host:   host,
+		Client: &httpClient,
+	}
+	crawler := Crawler{
+		Ctx:       cs.ctx,
+		RpcClient: &rpcClient,
+		QPS:       cs.PerPDSCrawlQPS,
+		Results:   cs.ingest,
+		Log:       cs.log,
+	}
+	start := time.Now()
+	cs.recordCrawlStart(host, start)
+	cs.log.Info("crawling", "host", host)
+	err := crawler.CrawlPDSRepoCollections()
+	cs.clearActiveCrawl(host)
+	if err != nil {
+		cs.log.Warn("crawl err", "host", host, "err", err)
+	} else {
+		dt := time.Since(start)
+		cs.log.Info("crawl done", "host", host, "dt", dt)
+	}
+}
+
+func (cs *collectionServer) recordCrawlStart(host string, start time.Time) {
+	cs.activeCrawlsLock.Lock()
+	defer cs.activeCrawlsLock.Unlock()
+	if cs.activeCrawlHosts == nil {
+		cs.activeCrawlHosts = make(map[string]time.Time)
+	}
+	cs.activeCrawlHosts[host] = start
+}
+
+func (cs *collectionServer) clearActiveCrawl(host string) {
+	cs.activeCrawlsLock.Lock()
+	defer cs.activeCrawlsLock.Unlock()
+	if cs.activeCrawlHosts == nil {
+		return
+	}
+	delete(cs.activeCrawlHosts, host)
+}
+
+type CrawlStatusResponse struct {
+	HostStarts map[string]string `json:"host_starts"`
+}
+
+// GET /v1/crawlStatus
+func (cs *collectionServer) crawlStatus(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+	if authHeader != cs.ExepctedAuthHeader {
+		return c.JSON(http.StatusForbidden, CrawlRequestResponse{Error: "nope"})
+	}
+	var out CrawlStatusResponse
+	out.HostStarts = make(map[string]string)
+	cs.activeCrawlsLock.Lock()
+	defer cs.activeCrawlsLock.Unlock()
+	for host, start := range cs.activeCrawlHosts {
+		out.HostStarts[host] = start.UTC().Format(time.RFC3339)
+	}
+	return c.JSON(http.StatusOK, out)
 }
