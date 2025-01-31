@@ -116,6 +116,7 @@ type Crawler struct {
 	Log       *slog.Logger
 }
 
+// CrawlPDSRepoCollections
 // write results to chan
 // does _not_ close chan
 // (allow multiple threads of PDS queries running to one output chan, e.g. feeding into SetFromResults() )

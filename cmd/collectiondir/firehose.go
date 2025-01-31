@@ -7,6 +7,7 @@ import (
 	"github.com/gorilla/websocket"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -19,10 +20,30 @@ type Firehose struct {
 	events chan<- *events.XRPCStreamEvent
 }
 
-func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *events.XRPCStreamEvent) {
+func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *events.XRPCStreamEvent) error {
 	d := websocket.Dialer{}
 
-	protocol := "wss"
+	rurl, err := url.Parse(fh.Host)
+	if err != nil {
+		rurl = new(url.URL)
+		rurl.Host = fh.Host
+		rurl.Scheme = "wss"
+	} else {
+		if rurl.Scheme == fh.Host {
+			rurl.Scheme = "wss"
+		}
+		if rurl.Scheme == "https" || rurl.Scheme == "wss" {
+			rurl.Scheme = "wss"
+		} else if rurl.Scheme == "http" || rurl.Scheme == "ws" {
+			rurl.Scheme = "ws"
+		} else if rurl.Scheme == "" {
+			rurl.Scheme = "wss"
+		} else {
+			return fmt.Errorf("host unknown scheme %#v", rurl.Scheme)
+		}
+	}
+	//protocol := "wss"
+	subscribeReposUrl := rurl.JoinPath("/xrpc/com.atproto.sync.subscribeRepos")
 	fh.events = fhevents
 	defer close(fhevents)
 
@@ -30,7 +51,7 @@ func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		default:
 		}
 
@@ -38,16 +59,14 @@ func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *
 			"User-Agent": []string{"bgs-rainbow-v0"},
 		}
 
-		var url string
-		if fh.Seq < 0 {
-			url = fmt.Sprintf("%s://%s/xrpc/com.atproto.sync.subscribeRepos", protocol, fh.Host)
-		} else {
-			url = fmt.Sprintf("%s://%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", protocol, fh.Host, fh.Seq)
+		if fh.Seq >= 0 {
+			subscribeReposUrl.RawQuery = fmt.Sprintf("cursor=%d", fh.Seq)
 		}
+		url := subscribeReposUrl.String()
 		con, res, err := d.DialContext(ctx, url, header)
 		if err != nil {
-			fh.Log.Warn("dialing failed", "host", fh.Host, "err", err, "backoff", backoff)
-			time.Sleep(5 * time.Second) // TODO: backoff strategy?
+			fh.Log.Warn("dialing failed", "url", url, "err", err, "backoff", backoff)
+			time.Sleep(5 * time.Second)
 			backoff++
 
 			continue

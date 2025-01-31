@@ -8,6 +8,7 @@ import (
 	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 	"log/slog"
 	"net"
@@ -98,7 +99,8 @@ type collectionServer struct {
 
 	ratelimitHeader string
 
-	esrv *echo.Echo
+	esrv          *echo.Echo
+	metricsServer *http.Server
 }
 
 const defaultPerPDSCrawlQPS = 100
@@ -131,7 +133,10 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 	go func() {
 		errchan <- cs.StartApiServer(cctx.Context, apiAddr)
 	}()
-	// TODO run metrics
+	metricsAddr := cctx.String("api-listen")
+	go func() {
+		errchan <- cs.StartMetricsServer(cctx.Context, metricsAddr)
+	}()
 
 	upstream := cctx.String("upstream")
 	if upstream != "" {
@@ -166,6 +171,7 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 
 func (cs *collectionServer) Shutdown() error {
 	close(cs.shutdown)
+	go cs.metricsServer.Shutdown(context.Background())
 	err := cs.esrv.Shutdown(context.Background())
 	cs.wg.Wait()
 	ee := cs.pcd.Close()
@@ -183,7 +189,10 @@ func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events
 		<-cs.shutdown
 		cancel()
 	}()
-	fh.subscribeWithRedialer(ctx, fhevents)
+	err := fh.subscribeWithRedialer(ctx, fhevents)
+	if err != nil {
+		cs.log.Error("failed to subscribe to redialer", "err", err)
+	}
 	if fh.Seq >= 0 {
 		err := cs.pcd.SetSequence(fh.Seq)
 		if err != nil {
@@ -201,6 +210,7 @@ func (cs *collectionServer) handleFirehose(fhevents <-chan *events.XRPCStreamEve
 		case <-cs.shutdown:
 			cs.pcd.SetSequence(lastSeq)
 		case evt := <-fhevents:
+			firehoseReceivedCounter.Inc()
 			seq, ok := evt.GetSequence()
 			if ok {
 				lastSeq = seq
@@ -230,6 +240,16 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 	}
 }
 
+func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string) error {
+	cs.wg.Add(1)
+	defer cs.wg.Done()
+	cs.metricsServer = &http.Server{
+		Addr:    addr,
+		Handler: promhttp.Handler(),
+	}
+	return cs.metricsServer.ListenAndServe()
+}
+
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
 	cs.wg.Add(1)
 	defer cs.wg.Done()
@@ -241,20 +261,27 @@ func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) err
 	e := echo.New()
 	e.HideBanner = true
 
+	e.Use(MetricsMiddleware)
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins: []string{"*"},
 		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization},
 	}))
 
+	e.GET("/_health", cs.healthz)
+
 	e.GET("/v1/getDidsForCollection", cs.getDidsForCollection)
 	e.GET("/v1/listCollections", cs.listCollections)
 
 	// admin auth heador required
+	//e.GET("/xrpc/com.atproto.sync.requestCrawl", cs.crawlPds)
+	//e.POST("/xrpc/com.atproto.sync.requestCrawl", cs.crawlPds)
+	e.POST("/admin/pds/requestCrawl", cs.crawlPds) // same as relay
 	e.POST("/v1/crawlRequest", cs.crawlPds)
 	e.GET("/v1/crawlStatus", cs.crawlStatus)
 
 	e.Listener = li
 	srv := &http.Server{}
+	cs.esrv = e
 	return e.StartServer(srv)
 }
 
@@ -411,14 +438,14 @@ func (cs *collectionServer) statsBuilder() {
 // returns
 // {"collections":{"app.bsky.feed.post": 123456789, "some collection": 42}, "cursor":"opaque text"}
 func (cs *collectionServer) listCollections(c echo.Context) error {
-	cursor := c.QueryParam("cursor")
-	collections, hasQueryCollections := c.QueryParams()["c"]
 	stats, err := cs.getStatsCache()
-	limit := getLimit(c, 50, 500, 1000)
 	if err != nil {
 		slog.Error("getStatsCache", "err", err)
 		return c.String(http.StatusInternalServerError, "oops")
 	}
+	cursor := c.QueryParam("cursor")
+	collections, hasQueryCollections := c.QueryParams()["c"]
+	limit := getLimit(c, 50, 500, 1000)
 	var out ListCollectionsResponse
 	if hasQueryCollections {
 		out.Collections = make(map[string]uint64, len(collections))
@@ -459,7 +486,7 @@ func (cs *collectionServer) ingestReceiver() {
 }
 
 type CrawlRequest struct {
-	Host  string   `json:"host,omitempty"`
+	Host  string   `json:"hostname,omitempty"`
 	Hosts []string `json:"hosts,omitempty"`
 }
 
@@ -584,4 +611,9 @@ func (cs *collectionServer) crawlStatus(c echo.Context) error {
 		out.HostStarts[host] = start.UTC().Format(time.RFC3339)
 	}
 	return c.JSON(http.StatusOK, out)
+}
+
+func (cs *collectionServer) healthz(c echo.Context) error {
+	// TODO: check database or upstream health?
+	return c.String(http.StatusOK, "ok")
 }
