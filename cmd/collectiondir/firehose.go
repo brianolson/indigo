@@ -19,12 +19,12 @@ type Firehose struct {
 	events chan<- *events.XRPCStreamEvent
 }
 
-func (fh *Firehose) subscribeWithRedialer(ctx context.Context, events chan<- *events.XRPCStreamEvent) {
+func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *events.XRPCStreamEvent) {
 	d := websocket.Dialer{}
 
 	protocol := "wss"
-	fh.events = events
-	defer close(events)
+	fh.events = fhevents
+	defer close(fhevents)
 
 	var backoff int
 	for {

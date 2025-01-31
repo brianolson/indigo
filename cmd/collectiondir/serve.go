@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -54,6 +56,11 @@ var serveCmd = &cli.Command{
 			Usage: "per-PDS crawl queries-per-second limit",
 			Value: 100,
 		},
+		&cli.StringFlag{
+			Name:    "ratelimit-header",
+			Usage:   "secret for friend PDSes",
+			EnvVars: []string{"BSKY_SOCIAL_RATE_LIMIT_SKIP", "RATE_LIMIT_HEADER"},
+		},
 		&cli.BoolFlag{
 			Name: "verbose",
 		},
@@ -84,14 +91,28 @@ type collectionServer struct {
 
 	activeCrawlHosts map[string]time.Time
 	activeCrawlsLock sync.Mutex
+
+	shutdown chan struct{}
+
+	wg sync.WaitGroup
+
+	ratelimitHeader string
+
+	esrv *echo.Echo
 }
 
 const defaultPerPDSCrawlQPS = 100
 
 func (cs *collectionServer) run(cctx *cli.Context) error {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	cs.shutdown = make(chan struct{})
 	level := slog.LevelInfo
 	if cctx.Bool("verbose") {
 		level = slog.LevelDebug
+	}
+	if cctx.IsSet("ratelimit-header") {
+		cs.ratelimitHeader = cctx.String("ratelimit-header")
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	cs.log = log
@@ -117,19 +138,76 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 		fh := Firehose{
 			Log:  log,
 			Host: upstream,
-			Seq:  -1, // TODO: persist sequence
+			Seq:  -1,
 		}
-		events := make(chan *events.XRPCStreamEvent, 1000)
-		go fh.subscribeWithRedialer(cctx.Context, events)
+		seq, seqok, err := cs.pcd.GetSequence()
+		if err != nil {
+			cs.log.Warn("db get seq", "err", err)
+		} else if seqok {
+			fh.Seq = seq
+		}
+		fhevents := make(chan *events.XRPCStreamEvent, 1000)
+		go cs.firehoseThread(&fh, fhevents)
+		go cs.handleFirehose(fhevents)
 	}
 
-	return <-errchan
+	select {
+	case <-signals:
+		log.Info("received shutdown signal")
+		return cs.Shutdown()
+	case err := <-errchan:
+		if err != nil {
+			log.Error("server error", "err", err)
+			return cs.Shutdown()
+		}
+	}
+	return nil
 }
 
-func (cs *collectionServer) handleFirehose(events <-chan *events.XRPCStreamEvent) {
-	for evt := range events {
-		if evt.RepoCommit != nil {
-			cs.handleCommit(evt.RepoCommit)
+func (cs *collectionServer) Shutdown() error {
+	close(cs.shutdown)
+	err := cs.esrv.Shutdown(context.Background())
+	cs.wg.Wait()
+	ee := cs.pcd.Close()
+	if ee != nil {
+		cs.log.Error("failed to shutdown pebble", "err", ee)
+	}
+	return err
+}
+
+func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events.XRPCStreamEvent) {
+	cs.wg.Add(1)
+	defer cs.wg.Done()
+	ctx, cancel := context.WithCancel(cs.ctx)
+	go func() {
+		<-cs.shutdown
+		cancel()
+	}()
+	fh.subscribeWithRedialer(ctx, fhevents)
+	if fh.Seq >= 0 {
+		err := cs.pcd.SetSequence(fh.Seq)
+		if err != nil {
+			cs.log.Warn("db set seq", "err", err)
+		}
+	}
+}
+
+func (cs *collectionServer) handleFirehose(fhevents <-chan *events.XRPCStreamEvent) {
+	cs.wg.Add(1)
+	defer cs.wg.Done()
+	var lastSeq int64
+	for {
+		select {
+		case <-cs.shutdown:
+			cs.pcd.SetSequence(lastSeq)
+		case evt := <-fhevents:
+			seq, ok := evt.GetSequence()
+			if ok {
+				lastSeq = seq
+			}
+			if evt.RepoCommit != nil {
+				cs.handleCommit(evt.RepoCommit)
+			}
 		}
 	}
 }
@@ -153,6 +231,8 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 }
 
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
+	cs.wg.Add(1)
+	defer cs.wg.Done()
 	var lc net.ListenConfig
 	li, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -442,6 +522,11 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 	rpcClient := xrpc.Client{
 		Host:   host,
 		Client: &httpClient,
+	}
+	if cs.ratelimitHeader != "" {
+		rpcClient.Headers = map[string]string{
+			"x-ratelimit-bypass": cs.ratelimitHeader,
+		}
 	}
 	crawler := Crawler{
 		Ctx:       cs.ctx,

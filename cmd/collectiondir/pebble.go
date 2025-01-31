@@ -351,3 +351,25 @@ func (pcd *PebbleCollectionDirectory) GetCollectionStats() (stats CollectionStat
 
 	return stats, nil
 }
+
+const seqKey = "Xseq"
+
+func (pcd *PebbleCollectionDirectory) SetSequence(seq int64) error {
+	var seqb [8]byte
+	binary.BigEndian.PutUint64(seqb[:], uint64(seq))
+	return pcd.db.Set([]byte(seqKey), seqb[:], pebble.NoSync)
+}
+func (pcd *PebbleCollectionDirectory) GetSequence() (int64, bool, error) {
+	vbytes, closer, err := pcd.db.Get([]byte(seqKey))
+	if closer != nil {
+		defer closer.Close()
+	}
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("pebble seq err, %w", err)
+	}
+	seq := int64(binary.BigEndian.Uint64(vbytes))
+	return seq, true, nil
+}
