@@ -99,7 +99,8 @@ type collectionServer struct {
 
 	ratelimitHeader string
 
-	esrv          *echo.Echo
+	apiServer *http.Server
+	//esrv          *echo.Echo
 	metricsServer *http.Server
 }
 
@@ -125,7 +126,9 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 	cs.AdminToken = cctx.String("admin-token")
 	cs.ExepctedAuthHeader = "Bearer " + cs.AdminToken
 	pebblePath := cctx.String("pebble")
-	cs.pcd = &PebbleCollectionDirectory{}
+	cs.pcd = &PebbleCollectionDirectory{
+		log: cs.log,
+	}
 	err := cs.pcd.Open(pebblePath)
 	if err != nil {
 		return fmt.Errorf("%s: failed to open pebble db: %w", pebblePath, err)
@@ -137,7 +140,7 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 	go func() {
 		errchan <- cs.StartApiServer(cctx.Context, apiAddr)
 	}()
-	metricsAddr := cctx.String("api-listen")
+	metricsAddr := cctx.String("metrics-listen")
 	cs.wg.Add(1)
 	go func() {
 		errchan <- cs.StartMetricsServer(cctx.Context, metricsAddr)
@@ -166,30 +169,48 @@ func (cs *collectionServer) run(cctx *cli.Context) error {
 	select {
 	case <-signals:
 		log.Info("received shutdown signal")
+		go errchanlog(cs.log, "server error", errchan)
 		return cs.Shutdown()
 	case err := <-errchan:
 		if err != nil {
 			log.Error("server error", "err", err)
+			go errchanlog(cs.log, "server error", errchan)
 			return cs.Shutdown()
 		}
 	}
 	return nil
 }
 
+func errchanlog(log *slog.Logger, msg string, errchan <-chan error) {
+	for err := range errchan {
+		log.Error(msg, "err", err)
+	}
+}
+
 func (cs *collectionServer) Shutdown() error {
 	close(cs.shutdown)
-	go cs.metricsServer.Shutdown(context.Background())
-	err := cs.esrv.Shutdown(context.Background())
+	go func() {
+		cs.log.Info("metrics shutdown start")
+		cs.metricsServer.Shutdown(context.Background())
+		cs.log.Info("metrics shutdown")
+	}()
+	cs.log.Info("api shutdown start...")
+	err := cs.apiServer.Shutdown(context.Background())
+	//err := cs.esrv.Shutdown(context.Background())
+	cs.log.Info("api shutdown, thread wait...", "err", err)
 	cs.wg.Wait()
+	cs.log.Info("threads done, db close...")
 	ee := cs.pcd.Close()
 	if ee != nil {
 		cs.log.Error("failed to shutdown pebble", "err", ee)
 	}
+	cs.log.Info("db done. done.")
 	return err
 }
 
 func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events.XRPCStreamEvent) {
 	defer cs.wg.Done()
+	defer cs.log.Info("firehoseThread exit")
 	ctx, cancel := context.WithCancel(cs.ctx)
 	go func() {
 		<-cs.shutdown
@@ -209,21 +230,35 @@ func (cs *collectionServer) firehoseThread(fh *Firehose, fhevents chan<- *events
 
 func (cs *collectionServer) handleFirehose(fhevents <-chan *events.XRPCStreamEvent) {
 	defer cs.wg.Done()
+	defer cs.log.Info("handleFirehose exit")
 	var lastSeq int64
-	for {
+	lastSeqSet := false
+	notDone := true
+	for notDone {
 		select {
 		case <-cs.shutdown:
-			cs.pcd.SetSequence(lastSeq)
-		case evt := <-fhevents:
+			cs.log.Info("firehose handler shutdown")
+			notDone = false
+		case evt, ok := <-fhevents:
+			if !ok {
+				notDone = false
+				cs.log.Info("firehose handler closed")
+				break
+			}
 			firehoseReceivedCounter.Inc()
 			seq, ok := evt.GetSequence()
 			if ok {
 				lastSeq = seq
+				lastSeqSet = true
 			}
 			if evt.RepoCommit != nil {
+				firehoseCommits.Inc()
 				cs.handleCommit(evt.RepoCommit)
 			}
 		}
+	}
+	if lastSeqSet {
+		cs.pcd.SetSequence(lastSeq)
 	}
 }
 
@@ -236,7 +271,9 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 			return
 		}
 		collection := op.Path[:slash]
-		if op.Action == "commit" || op.Action == "update" {
+		firehoseCommitOps.WithLabelValues(op.Action).Inc()
+		if op.Action == "create" || op.Action == "update" {
+			firehoseDidcSet.Inc()
 			cs.ingest <- DidCollection{
 				Did:        commit.Repo,
 				Collection: collection,
@@ -247,6 +284,7 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 
 func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string) error {
 	defer cs.wg.Done()
+	defer cs.log.Info("metrics server exit")
 	cs.metricsServer = &http.Server{
 		Addr:    addr,
 		Handler: promhttp.Handler(),
@@ -256,6 +294,7 @@ func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string)
 
 func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) error {
 	defer cs.wg.Done()
+	defer cs.log.Info("api server exit")
 	var lc net.ListenConfig
 	li, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -283,9 +322,13 @@ func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) err
 	e.GET("/v1/crawlStatus", cs.crawlStatus)
 
 	e.Listener = li
-	srv := &http.Server{}
-	cs.esrv = e
-	return e.StartServer(srv)
+	srv := &http.Server{
+		Handler: e,
+	}
+	cs.apiServer = srv
+	return srv.Serve(li)
+	//cs.esrv = e
+	//return e.StartServer(srv)
 }
 
 const statsCacheDuration = time.Second * 300
@@ -337,13 +380,21 @@ func (cs *collectionServer) getDidsForCollection(c echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
-func (cs *collectionServer) getStatsCache() (*CollectionStats, error) {
+// return cached collection stats if they're fresh
+// return new collection stats if they can be calculated quicly
+// return stale cached collection stats if new stats take too long
+// just wait for fresh stats if there are no cached stats
+// stalenessAllowed is how old stats can be before we try to recalculate them, 0=default of 5 minutes
+func (cs *collectionServer) getStatsCache(stalenessAllowed time.Duration) (*CollectionStats, error) {
+	if stalenessAllowed <= 0 {
+		stalenessAllowed = statsCacheDuration
+	}
 	var statsCache *CollectionStats
 	var staleCache *CollectionStats
 	var waiter *freshStatsWaiter
 	cs.statsCacheLock.Lock()
 	if cs.statsCache != nil {
-		if time.Since(cs.statsCacheWhen) < statsCacheDuration {
+		if time.Since(cs.statsCacheWhen) < stalenessAllowed {
 			// has fresh!
 			statsCache = cs.statsCache
 		} else if !cs.statsCachePending {
@@ -420,8 +471,15 @@ func (fsw *freshStatsWaiter) waiter() {
 
 func (cs *collectionServer) statsBuilder() {
 	for {
+		start := time.Now()
 		stats, err := cs.pcd.GetCollectionStats()
+		dt := time.Since(start)
 		if err == nil {
+			countsum := uint64(0)
+			for _, v := range stats.CollectionCounts {
+				countsum += v
+			}
+			cs.log.Info("stats built", "dt", dt, "total", countsum)
 			cs.statsCacheLock.Lock()
 			cs.statsCache = &stats
 			cs.statsCacheWhen = time.Now()
@@ -430,7 +488,7 @@ func (cs *collectionServer) statsBuilder() {
 			cs.statsCacheLock.Unlock()
 			return
 		} else {
-			slog.Error("GetCollectionStats", "err", err)
+			cs.log.Error("GetCollectionStats", "dt", dt, "err", err)
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -438,10 +496,26 @@ func (cs *collectionServer) statsBuilder() {
 
 // /v1/listCollections?c={}&cursor={}&limit={50<=limit<=1000}
 //
+// admin may set ?stalesec={} for a maximum number of seconds stale data is accepted
+//
 // returns
 // {"collections":{"app.bsky.feed.post": 123456789, "some collection": 42}, "cursor":"opaque text"}
 func (cs *collectionServer) listCollections(c echo.Context) error {
-	stats, err := cs.getStatsCache()
+	stalenessAllowed := statsCacheDuration
+	stalesecStr := c.QueryParam("stalesec")
+	if stalesecStr != "" && cs.isAdmin(c) {
+		stalesec, err := strconv.ParseInt(stalesecStr, 10, 64)
+		if err != nil {
+			return c.String(http.StatusBadRequest, "bad stalesec")
+		}
+		if stalesec == 0 {
+			stalenessAllowed = 1
+		} else {
+			stalenessAllowed = time.Duration(stalesec) * time.Second
+		}
+		cs.log.Info("stalesec", "q", stalesecStr, "d", stalenessAllowed)
+	}
+	stats, err := cs.getStatsCache(stalenessAllowed)
 	if err != nil {
 		slog.Error("getStatsCache", "err", err)
 		return c.String(http.StatusInternalServerError, "oops")
@@ -486,6 +560,7 @@ type ListCollectionsResponse struct {
 
 func (cs *collectionServer) ingestReceiver() {
 	defer cs.wg.Done()
+	defer cs.log.Info("ingestReceiver exit")
 	cs.pcd.SetFromResults(cs.ingest)
 }
 
@@ -513,6 +588,18 @@ func hostOrUrlToUrl(host string) string {
 	return host
 }
 
+func (cs *collectionServer) isAdmin(c echo.Context) bool {
+	authHeader := c.Request().Header.Get("Authorization")
+	if authHeader == "" {
+		return false
+	}
+	if authHeader == cs.ExepctedAuthHeader {
+		return true
+	}
+	cs.log.Info("wrong auth header", "header", authHeader, "expected", cs.ExepctedAuthHeader)
+	return false
+}
+
 // /v1/crawlRequest
 // requires header `Authorization: Bearer {admin token}`
 //
@@ -520,8 +607,8 @@ func hostOrUrlToUrl(host string) string {
 // OR
 // POST /v1/crawlRequest?host={one host}
 func (cs *collectionServer) crawlPds(c echo.Context) error {
-	authHeader := c.Request().Header.Get("Authorization")
-	if authHeader != cs.ExepctedAuthHeader {
+	isAdmin := cs.isAdmin(c)
+	if !isAdmin {
 		return c.JSON(http.StatusForbidden, CrawlRequestResponse{Error: "nope"})
 	}
 	hostQ := c.QueryParam("host")

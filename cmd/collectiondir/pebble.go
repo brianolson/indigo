@@ -294,6 +294,7 @@ func (pcd *PebbleCollectionDirectory) MaybeSetCollection(did, collection string)
 	}
 	if err == nil {
 		// already exists, done
+		pebbleDup.Inc()
 		return nil
 	}
 	if errors.Is(err, pebble.ErrNotFound) {
@@ -314,6 +315,7 @@ func (pcd *PebbleCollectionDirectory) MaybeSetCollection(did, collection string)
 	if err != nil {
 		return fmt.Errorf("pebble set err, %w", err)
 	}
+	pebbleNew.Inc()
 	return nil
 }
 

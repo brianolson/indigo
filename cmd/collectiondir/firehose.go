@@ -21,6 +21,7 @@ type Firehose struct {
 }
 
 func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *events.XRPCStreamEvent) error {
+	defer close(fhevents)
 	d := websocket.Dialer{}
 
 	rurl, err := url.Parse(fh.Host)
@@ -45,7 +46,6 @@ func (fh *Firehose) subscribeWithRedialer(ctx context.Context, fhevents chan<- *
 	//protocol := "wss"
 	subscribeReposUrl := rurl.JoinPath("/xrpc/com.atproto.sync.subscribeRepos")
 	fh.events = fhevents
-	defer close(fhevents)
 
 	var backoff int
 	for {
