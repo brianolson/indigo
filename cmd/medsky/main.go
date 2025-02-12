@@ -16,11 +16,9 @@ import (
 
 	"github.com/bluesky-social/indigo/api"
 	libbgs "github.com/bluesky-social/indigo/cmd/medsky/bgs"
-	"github.com/bluesky-social/indigo/cmd/medsky/indexer"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/notifs"
 	"github.com/bluesky-social/indigo/plc"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
@@ -73,12 +71,6 @@ func run(args []string) error {
 			Value:   "sqlite://./data/bigsky/bgs.sqlite",
 			EnvVars: []string{"DATABASE_URL"},
 		},
-		//&cli.StringFlag{
-		//	Name:    "carstore-db-url",
-		//	Usage:   "database connection string for carstore database",
-		//	Value:   "sqlite://./data/bigsky/carstore.sqlite",
-		//	EnvVars: []string{"CARSTORE_DATABASE_URL"},
-		//},
 		&cli.BoolFlag{
 			Name: "db-tracing",
 		},
@@ -121,11 +113,6 @@ func run(args []string) error {
 			Name:    "handle-resolver-hosts",
 			EnvVars: []string{"HANDLE_RESOLVER_HOSTS"},
 		},
-		//&cli.IntFlag{
-		//	Name:    "max-carstore-connections",
-		//	EnvVars: []string{"MAX_CARSTORE_CONNECTIONS"},
-		//	Value:   40,
-		//},
 		&cli.IntFlag{
 			Name:    "max-metadb-connections",
 			EnvVars: []string{"MAX_METADB_CONNECTIONS"},
@@ -177,11 +164,13 @@ func run(args []string) error {
 		},
 		&cli.IntFlag{
 			Name:    "did-cache-size",
+			Usage:   "in-process cache by number of Did documents. see also did-memcached",
 			EnvVars: []string{"RELAY_DID_CACHE_SIZE"},
 			Value:   5_000_000,
 		},
 		&cli.StringSliceFlag{
 			Name:    "did-memcached",
+			Usage:   "nearby memcached which is storing did documents. did-cache-size can be smaller if we have memcached",
 			EnvVars: []string{"RELAY_DID_MEMCACHED"},
 		},
 		&cli.DurationFlag{
@@ -190,31 +179,10 @@ func run(args []string) error {
 			EnvVars: []string{"RELAY_EVENT_PLAYBACK_TTL"},
 			Value:   72 * time.Hour,
 		},
-		//&cli.StringSliceFlag{
-		//	Name:    "carstore-shard-dirs",
-		//	Usage:   "specify list of shard directories for carstore storage, overrides default storage within datadir",
-		//	EnvVars: []string{"RELAY_CARSTORE_SHARD_DIRS"},
-		//},
 		&cli.StringSliceFlag{
 			Name:    "next-crawler",
 			Usage:   "forward POST requestCrawl to this url, should be machine root url and not xrpc/requestCrawl, comma separated list",
 			EnvVars: []string{"RELAY_NEXT_CRAWLER"},
-		},
-		//&cli.BoolFlag{
-		//	Name:  "ex-sqlite-carstore",
-		//	Usage: "enable experimental sqlite carstore",
-		//	Value: false,
-		//},
-		//&cli.StringSliceFlag{
-		//	Name:    "scylla-carstore",
-		//	Usage:   "scylla server addresses for storage backend, comma separated",
-		//	Value:   &cli.StringSlice{},
-		//	EnvVars: []string{"RELAY_SCYLLA_NODES"},
-		//},
-		&cli.BoolFlag{
-			Name:    "non-archival",
-			EnvVars: []string{"RELAY_NON_ARCHIVAL"},
-			Value:   false,
 		},
 	}
 
@@ -306,7 +274,6 @@ func runBigsky(cctx *cli.Context) error {
 
 	// ensure data directory exists; won't error if it does
 	datadir := cctx.String("data-dir")
-	//csdir := filepath.Join(datadir, "carstore")
 	if err := os.MkdirAll(datadir, os.ModePerm); err != nil {
 		return err
 	}
@@ -322,58 +289,6 @@ func runBigsky(cctx *cli.Context) error {
 			return err
 		}
 	}
-
-	//var cstore carstore.CarStore
-	//scyllaAddrs := cctx.StringSlice("scylla-carstore")
-	//sqliteStore := cctx.Bool("ex-sqlite-carstore")
-	//if len(scyllaAddrs) != 0 {
-	//	slog.Info("starting scylla carstore", "addrs", scyllaAddrs)
-	//	cstore, err = carstore.NewScyllaStore(scyllaAddrs, "cs")
-	//} else if sqliteStore {
-	//	slog.Info("starting sqlite carstore", "dir", csdir)
-	//	cstore, err = carstore.NewSqliteStore(csdir)
-	//} else if cctx.Bool("non-archival") {
-	//	csdburl := cctx.String("carstore-db-url")
-	//	slog.Info("setting up non-archival carstore database", "url", csdburl)
-	//	csdb, err := cliutil.SetupDatabase(csdburl, cctx.Int("max-carstore-connections"))
-	//	if err != nil {
-	//		return err
-	//	}
-	//	if cctx.Bool("db-tracing") {
-	//		if err := csdb.Use(tracing.NewPlugin()); err != nil {
-	//			return err
-	//		}
-	//	}
-	//	cs, err := carstore.NewNonArchivalCarstore(csdb)
-	//	if err != nil {
-	//		return err
-	//	}
-	//	cstore = cs
-	//} else {
-	//	// make standard FileCarStore
-	//	csdburl := cctx.String("carstore-db-url")
-	//	slog.Info("setting up carstore database", "url", csdburl)
-	//	csdb, err := cliutil.SetupDatabase(csdburl, cctx.Int("max-carstore-connections"))
-	//	if err != nil {
-	//		return err
-	//	}
-	//	if cctx.Bool("db-tracing") {
-	//		if err := csdb.Use(tracing.NewPlugin()); err != nil {
-	//			return err
-	//		}
-	//	}
-	//	csdirs := []string{csdir}
-	//	if paramDirs := cctx.StringSlice("carstore-shard-dirs"); len(paramDirs) > 0 {
-	//		csdirs = paramDirs
-	//	}
-	//
-	//	for _, csd := range csdirs {
-	//		if err := os.MkdirAll(filepath.Dir(csd), os.ModePerm); err != nil {
-	//			return err
-	//		}
-	//	}
-	//	cstore, err = carstore.NewCarStore(csdb, csdirs)
-	//}
 
 	if err != nil {
 		return err
@@ -407,7 +322,7 @@ func runBigsky(cctx *cli.Context) error {
 		cachedidr = plc.NewCachingDidResolver(prevResolver, time.Hour*24, cctx.Int("did-cache-size"))
 	}
 
-	kmgr := repomgr.NewKeyManager(cachedidr, nil)
+	kmgr := repomgr.NewKeyManager(cachedidr)
 
 	repoman := repomgr.NewRepoManager(kmgr)
 
@@ -434,16 +349,9 @@ func runBigsky(cctx *cli.Context) error {
 
 	evtman := events.NewEventManager(persister)
 
-	notifman := &notifs.NullNotifs{}
-
-	ix, err := indexer.NewIndexer(db, notifman, evtman, cachedidr)
-	if err != nil {
-		return err
-	}
-	defer ix.Shutdown()
-
 	rlskip := cctx.String("bsky-social-rate-limit-skip")
-	ix.ApplyPDSClientSettings = func(c *xrpc.Client) {
+	// TODO: pass this into bgs somehow -- bolson 2025
+	applyPDSClientSettings := func(c *xrpc.Client) {
 		if c.Client == nil {
 			c.Client = util.RobustHTTPClient()
 		}
@@ -460,12 +368,7 @@ func runBigsky(cctx *cli.Context) error {
 		}
 	}
 
-	//repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
-	//	if err := ix.HandleRepoEvent(ctx, evt); err != nil {
-	//		slog.Error("failed to handle repo event", "err", err)
-	//	}
-	//})
-	repoman.SetNext(ix)
+	repoman.SetEventManager(evtman)
 
 	prodHR, err := api.NewProdHandleResolver(100_000, cctx.String("resolve-address"), cctx.Bool("force-dns-udp"))
 	if err != nil {
@@ -493,6 +396,7 @@ func runBigsky(cctx *cli.Context) error {
 	bgsConfig.ConcurrencyPerPDS = cctx.Int64("concurrency-per-pds")
 	bgsConfig.MaxQueuePerPDS = cctx.Int64("max-queue-per-pds")
 	bgsConfig.DefaultRepoLimit = cctx.Int64("default-repo-limit")
+	bgsConfig.ApplyPDSClientSettings = applyPDSClientSettings
 	nextCrawlers := cctx.StringSlice("next-crawler")
 	if len(nextCrawlers) != 0 {
 		nextCrawlerUrls := make([]*url.URL, len(nextCrawlers))
@@ -506,7 +410,7 @@ func runBigsky(cctx *cli.Context) error {
 		}
 		bgsConfig.NextCrawlers = nextCrawlerUrls
 	}
-	bgs, err := libbgs.NewBGS(db, ix, repoman, evtman, cachedidr, hr, bgsConfig)
+	bgs, err := libbgs.NewBGS(db, repoman, evtman, cachedidr, hr, bgsConfig)
 	if err != nil {
 		return err
 	}

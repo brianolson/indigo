@@ -22,7 +22,6 @@ import (
 	"github.com/bluesky-social/indigo/api"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/cmd/medsky/indexer"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/events"
@@ -52,7 +51,6 @@ var tracer = otel.Tracer("bgs")
 const serverListenerBootTimeout = 5 * time.Second
 
 type BGS struct {
-	Index   *indexer.Indexer
 	db      *gorm.DB
 	slurper *Slurper
 	events  *events.EventManager
@@ -77,10 +75,6 @@ type BGS struct {
 	nextConsumerID uint64
 	consumers      map[uint64]*SocketConsumer
 
-	//// Management of Resyncs
-	//pdsResyncsLk sync.RWMutex
-	//pdsResyncs   map[uint]*PDSResync
-
 	// User cache
 	userCache *lru.Cache[string, *User]
 
@@ -89,17 +83,9 @@ type BGS struct {
 	httpClient   http.Client
 
 	log *slog.Logger
-}
 
-//type PDSResync struct {
-//	PDS              models.PDS `json:"pds"`
-//	NumRepoPages     int        `json:"numRepoPages"`
-//	NumRepos         int        `json:"numRepos"`
-//	NumReposChecked  int        `json:"numReposChecked"`
-//	NumReposToResync int        `json:"numReposToResync"`
-//	Status           string     `json:"status"`
-//	StatusChangedAt  time.Time  `json:"statusChangedAt"`
-//}
+	config BGSConfig
+}
 
 type SocketConsumer struct {
 	UserAgent   string
@@ -116,6 +102,8 @@ type BGSConfig struct {
 
 	// NextCrawlers gets forwarded POST /xrpc/com.atproto.sync.requestCrawl
 	NextCrawlers []*url.URL
+
+	ApplyPDSClientSettings func(c *xrpc.Client)
 }
 
 func DefaultBGSConfig() *BGSConfig {
@@ -127,7 +115,7 @@ func DefaultBGSConfig() *BGSConfig {
 	}
 }
 
-func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtman *events.EventManager, didr did.Resolver, hr api.HandleResolver, config *BGSConfig) (*BGS, error) {
+func NewBGS(db *gorm.DB, repoman *repomgr.RepoManager, evtman *events.EventManager, didr did.Resolver, hr api.HandleResolver, config *BGSConfig) (*BGS, error) {
 
 	if config == nil {
 		config = DefaultBGSConfig()
@@ -140,8 +128,7 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 	uc, _ := lru.New[string, *User](1_000_000)
 
 	bgs := &BGS{
-		Index: ix,
-		db:    db,
+		db: db,
 
 		hr:      hr,
 		repoman: repoman,
@@ -157,9 +144,10 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		userCache: uc,
 
 		log: slog.Default().With("system", "bgs"),
+
+		config: *config,
 	}
 
-	ix.CreateExternalUser = bgs.createExternalUser
 	slOpts := DefaultSlurperOptions()
 	slOpts.SSL = config.SSL
 	slOpts.DefaultRepoLimit = config.DefaultRepoLimit
@@ -511,6 +499,7 @@ func (bgs *BGS) cleanupConsumer(id uint64) {
 	delete(bgs.consumers, id)
 }
 
+// GET+websocket /xrpc/com.atproto.sync.subscribeRepos
 func (bgs *BGS) EventsHandler(c echo.Context) error {
 	var since *int64
 	if sinceVal := c.QueryParam("cursor"); sinceVal != "" {
@@ -802,9 +791,7 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 				return fmt.Errorf("fed event create external user: %w", err)
 			}
 
-			u = new(User)
-			u.ID = subj.Uid
-			u.Did = evt.Repo
+			u = subj
 		}
 
 		ustatus := u.GetUpstreamStatus()
@@ -874,8 +861,6 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 		}
 
 		if err := bgs.repoman.HandleCommit(ctx, host, u, evt); err != nil {
-
-			//if err := bgs.repoman.HandleExternalUserEvent(ctx, host.ID, u.ID, u.Did, evt.Since, evt.Rev, evt.Blocks, evt.Ops); err != nil {
 
 			if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
 				//ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
@@ -1067,26 +1052,20 @@ func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *a
 	}
 	u.SetTombstoned(true)
 
-	if err := bgs.db.Model(&models.ActorInfo{}).Where("uid = ?", u.ID).UpdateColumns(map[string]any{
-		"handle": nil,
-	}).Error; err != nil {
-		return err
-	}
-
 	return bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
 		RepoTombstone: evt,
 	})
 }
 
 // TODO: rename? This also updates users, and 'external' is an old phrasing
-func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.ActorInfo, error) {
+func (bgs *BGS) createExternalUser(ctx context.Context, did string) (*User, error) {
 	ctx, span := tracer.Start(ctx, "createExternalUser")
 	defer span.End()
 
 	externalUserCreationAttempts.Inc()
 
-	s.log.Debug("create external user", "did", did)
-	doc, err := s.didr.GetDocument(ctx, did)
+	bgs.log.Debug("create external user", "did", did)
+	doc, err := bgs.didr.GetDocument(ctx, did)
 	if err != nil {
 		return nil, fmt.Errorf("could not locate DID document for followed user (%s): %w", did, err)
 	}
@@ -1107,12 +1086,12 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 
 	// TODO: the PDS's DID should also be in the service, we could use that to look up?
 	var peering models.PDS
-	if err := s.db.Find(&peering, "host = ?", durl.Host).Error; err != nil {
-		s.log.Error("failed to find pds", "host", durl.Host)
+	if err := bgs.db.Find(&peering, "host = ?", durl.Host).Error; err != nil {
+		bgs.log.Error("failed to find pds", "host", durl.Host)
 		return nil, err
 	}
 
-	ban, err := s.domainIsBanned(ctx, durl.Host)
+	ban, err := bgs.domainIsBanned(ctx, durl.Host)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check pds ban status: %w", err)
 	}
@@ -1121,12 +1100,11 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 		return nil, fmt.Errorf("cannot create user on pds with banned domain")
 	}
 
-	c := &xrpc.Client{Host: durl.String()}
-	s.Index.ApplyPDSClientSettings(c)
-
 	if peering.ID == 0 {
+		pclient := &xrpc.Client{Host: durl.String()}
+		bgs.config.ApplyPDSClientSettings(pclient)
 		// TODO: the case of handling a new user on a new PDS probably requires more thought
-		cfg, err := atproto.ServerDescribeServer(ctx, c)
+		cfg, err := atproto.ServerDescribeServer(ctx, pclient)
 		if err != nil {
 			// TODO: failing this shouldn't halt our indexing
 			return nil, fmt.Errorf("failed to check unrecognized pds: %w", err)
@@ -1138,17 +1116,17 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 		// TODO: could check other things, a valid response is good enough for now
 		peering.Host = durl.Host
 		peering.SSL = (durl.Scheme == "https")
-		peering.CrawlRateLimit = float64(s.slurper.DefaultCrawlLimit)
-		peering.RateLimit = float64(s.slurper.DefaultPerSecondLimit)
-		peering.HourlyEventLimit = s.slurper.DefaultPerHourLimit
-		peering.DailyEventLimit = s.slurper.DefaultPerDayLimit
-		peering.RepoLimit = s.slurper.DefaultRepoLimit
+		peering.CrawlRateLimit = float64(bgs.slurper.DefaultCrawlLimit)
+		peering.RateLimit = float64(bgs.slurper.DefaultPerSecondLimit)
+		peering.HourlyEventLimit = bgs.slurper.DefaultPerHourLimit
+		peering.DailyEventLimit = bgs.slurper.DefaultPerDayLimit
+		peering.RepoLimit = bgs.slurper.DefaultRepoLimit
 
-		if s.ssl && !peering.SSL {
+		if bgs.ssl && !peering.SSL {
 			return nil, fmt.Errorf("did references non-ssl PDS, this is disallowed in prod: %q %q", did, svc.ServiceEndpoint)
 		}
 
-		if err := s.db.Create(&peering).Error; err != nil {
+		if err := bgs.db.Create(&peering).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -1166,7 +1144,7 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 	}
 
 	// Increment the repo count for the PDS
-	res := s.db.Model(&models.PDS{}).Where("id = ? AND repo_count < repo_limit", peering.ID).Update("repo_count", gorm.Expr("repo_count + 1"))
+	res := bgs.db.Model(&models.PDS{}).Where("id = ? AND repo_count < repo_limit", peering.ID).Update("repo_count", gorm.Expr("repo_count + 1"))
 	if res.Error != nil {
 		return nil, fmt.Errorf("failed to increment repo count for pds %q: %w", peering.Host, res.Error)
 	}
@@ -1180,8 +1158,8 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 	// Release the count if we fail to create the user
 	defer func() {
 		if !successfullyCreated {
-			if err := s.db.Model(&models.PDS{}).Where("id = ?", peering.ID).Update("repo_count", gorm.Expr("repo_count - 1")).Error; err != nil {
-				s.log.Error("failed to decrement repo count for pds", "err", err)
+			if err := bgs.db.Model(&models.PDS{}).Where("id = ?", peering.ID).Update("repo_count", gorm.Expr("repo_count - 1")).Error; err != nil {
+				bgs.log.Error("failed to decrement repo count for pds", "err", err)
 			}
 		}
 	}()
@@ -1195,56 +1173,47 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 		return nil, err
 	}
 
-	s.log.Debug("creating external user", "did", did, "handle", hurl.Host, "pds", peering.ID)
+	bgs.log.Debug("creating external user", "did", did, "handle", hurl.Host, "pds", peering.ID)
 
 	handle := hurl.Host
 
 	validHandle := true
 
-	resdid, err := s.hr.ResolveHandleToDid(ctx, handle)
+	resdid, err := bgs.hr.ResolveHandleToDid(ctx, handle)
 	if err != nil {
-		s.log.Error("failed to resolve users claimed handle on pds", "handle", handle, "err", err)
+		bgs.log.Error("failed to resolve users claimed handle on pds", "handle", handle, "err", err)
 		validHandle = false
 	}
 
 	if resdid != did {
-		s.log.Error("claimed handle did not match servers response", "resdid", resdid, "did", did)
+		bgs.log.Error("claimed handle did not match servers response", "resdid", resdid, "did", did)
 		validHandle = false
 	}
 
-	s.extUserLk.Lock()
-	defer s.extUserLk.Unlock()
+	bgs.extUserLk.Lock()
+	defer bgs.extUserLk.Unlock()
 
-	exu, err := s.Index.LookupUserByDid(ctx, did)
+	user, err := bgs.lookupUserByDid(ctx, did)
 	if err == nil {
-		s.log.Debug("lost the race to create a new user", "did", did, "handle", handle, "existing_hand", exu.Handle)
-		if exu.PDS != peering.ID {
+		bgs.log.Debug("lost the race to create a new user", "did", did, "handle", handle, "existing_hand", user.Handle)
+		if user.PDS != peering.ID {
 			// User is now on a different PDS, update
-			if err := s.db.Model(User{}).Where("id = ?", exu.Uid).Update("pds", peering.ID).Error; err != nil {
+			if err := bgs.db.Model(User{}).Where("id = ?", user.ID).Update("pds", peering.ID).Error; err != nil {
 				return nil, fmt.Errorf("failed to update users pds: %w", err)
 			}
 
-			if err := s.db.Model(models.ActorInfo{}).Where("uid = ?", exu.Uid).Update("pds", peering.ID).Error; err != nil {
-				return nil, fmt.Errorf("failed to update users pds on actorInfo: %w", err)
-			}
-
-			exu.PDS = peering.ID
+			user.PDS = peering.ID
 		}
 
-		if exu.Handle.String != handle {
+		if user.Handle.String != handle {
 			// Users handle has changed, update
-			if err := s.db.Model(User{}).Where("id = ?", exu.Uid).Update("handle", handle).Error; err != nil {
+			if err := bgs.db.Model(User{}).Where("id = ?", user.ID).Update("handle", handle).Error; err != nil {
 				return nil, fmt.Errorf("failed to update users handle: %w", err)
 			}
 
-			// Update ActorInfos
-			if err := s.db.Model(models.ActorInfo{}).Where("uid = ?", exu.Uid).Update("handle", handle).Error; err != nil {
-				return nil, fmt.Errorf("failed to update actorInfos handle: %w", err)
-			}
-
-			exu.Handle = sql.NullString{String: handle, Valid: true}
+			user.Handle = sql.NullString{String: handle, Valid: true}
 		}
-		return exu, nil
+		return user, nil
 	}
 
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1261,60 +1230,43 @@ func (s *BGS) createExternalUser(ctx context.Context, did string) (*models.Actor
 		u.Handle = sql.NullString{String: handle, Valid: true}
 	}
 
-	if err := s.db.Create(&u).Error; err != nil {
+	if err := bgs.db.Create(&u).Error; err != nil {
 		// If the new user's handle conflicts with an existing user,
 		// since we just validated the handle for this user, we'll assume
 		// the existing user no longer has control of the handle
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
 			// Get the UID of the existing user
 			var existingUser User
-			if err := s.db.Find(&existingUser, "handle = ?", handle).Error; err != nil {
+			if err := bgs.db.Find(&existingUser, "handle = ?", handle).Error; err != nil {
 				return nil, fmt.Errorf("failed to find existing user: %w", err)
 			}
 
 			// Set the existing user's handle to NULL and set the valid_handle flag to false
-			if err := s.db.Model(User{}).Where("id = ?", existingUser.ID).Update("handle", nil).Update("valid_handle", false).Error; err != nil {
+			if err := bgs.db.Model(User{}).Where("id = ?", existingUser.ID).Update("handle", nil).Update("valid_handle", false).Error; err != nil {
 				return nil, fmt.Errorf("failed to update outdated user's handle: %w", err)
 			}
 
 			// Do the same thing for the ActorInfo if it exists
-			if err := s.db.Model(models.ActorInfo{}).Where("uid = ?", existingUser.ID).Update("handle", nil).Update("valid_handle", false).Error; err != nil {
+			if err := bgs.db.Model(models.ActorInfo{}).Where("uid = ?", existingUser.ID).Update("handle", nil).Update("valid_handle", false).Error; err != nil {
 				if !errors.Is(err, gorm.ErrRecordNotFound) {
 					return nil, fmt.Errorf("failed to update outdated actorInfo's handle: %w", err)
 				}
 			}
 
 			// Create the new user
-			if err := s.db.Create(&u).Error; err != nil {
+			if err := bgs.db.Create(&u).Error; err != nil {
 				return nil, fmt.Errorf("failed to create user after handle conflict: %w", err)
 			}
 
-			s.userCache.Remove(did)
+			bgs.userCache.Remove(did)
 		} else {
 			return nil, fmt.Errorf("failed to create other pds user: %w", err)
 		}
 	}
 
-	// okay cool, its a user on a server we are peered with
-	// lets make a local record of that user for the future
-	subj := &models.ActorInfo{
-		Uid:         u.ID,
-		DisplayName: "", //*profile.DisplayName,
-		Did:         did,
-		Type:        "",
-		PDS:         peering.ID,
-		ValidHandle: validHandle,
-	}
-	if validHandle {
-		subj.Handle = sql.NullString{String: handle, Valid: true}
-	}
-	if err := s.db.Create(subj).Error; err != nil {
-		return nil, err
-	}
-
 	successfullyCreated = true
 
-	return subj, nil
+	return &u, nil
 }
 
 func (bgs *BGS) UpdateAccountStatus(ctx context.Context, did string, status string) error {

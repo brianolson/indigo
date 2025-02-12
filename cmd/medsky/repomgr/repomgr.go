@@ -6,21 +6,17 @@ import (
 	"errors"
 	"fmt"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
+	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/models"
-	"github.com/bluesky-social/indigo/mst"
 	"github.com/bluesky-social/indigo/repo"
 	blockformat "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/ipld/go-car"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 )
 
@@ -34,8 +30,8 @@ func NewRepoManager(kmgr *KeyManager) *RepoManager {
 	}
 }
 
-func (rm *RepoManager) SetNext(next NextCommitHandler) {
-	rm.next = next
+func (rm *RepoManager) SetEventManager(events *events.EventManager) {
+	rm.events = events
 }
 
 type RepoManager struct {
@@ -44,7 +40,7 @@ type RepoManager struct {
 	lklk      sync.Mutex
 	userLocks map[models.Uid]*userLock
 
-	next NextCommitHandler
+	events *events.EventManager
 
 	log       *slog.Logger
 	noArchive bool
@@ -183,6 +179,7 @@ func (rm *RepoManager) checkSliceSignature(ctx context.Context, repoDid string, 
 	return checkSliceSignature(ctx, rm.kmgr, repoDid, carslice)
 }
 
+// TODO: maybe this _doesn't_ need to return (repoFragement,root), but maybe still want them for induction firehose?
 func checkSliceSignature(ctx context.Context, kmgr *KeyManager, repoDid string, carslice []byte) (repoFragment *repo.Repo, root cid.Cid, err error) {
 	carr, err := car.NewCarReader(bytes.NewReader(carslice))
 	if err != nil {
@@ -237,176 +234,22 @@ type IUser interface {
 
 // TODO: move this to its own thing out of repomgr
 func (rm *RepoManager) HandleCommit(ctx context.Context, host *models.PDS, user IUser, commit *atproto.SyncSubscribeRepos_Commit) error {
-	err := rm.HandleExternalUserEvent(ctx, host.ID, user.GetUid(), user.GetDid(), commit.Since, commit.Rev, commit.Blocks, commit.Ops)
-	if err != nil {
-		return err
-	}
-	if rm.next != nil {
-		err = rm.next.HandleCommit(ctx, host, user.GetUid(), user.GetDid(), commit)
-		if err != nil {
-			rm.log.Error("next handle commit", "err", err)
-		}
-	}
-	return nil
-}
-
-func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, uid models.Uid, did string, since *string, nrev string, carslice []byte, ops []*atproto.SyncSubscribeRepos_RepoOp) error {
-	ctx, span := otel.Tracer("repoman").Start(ctx, "HandleExternalUserEvent")
-	defer span.End()
-
-	span.SetAttributes(attribute.Int64("uid", int64(uid)))
-
-	rm.log.Debug("HandleExternalUserEvent", "pds", pdsid, "uid", uid, "since", since, "nrev", nrev)
-
+	uid := user.GetUid()
 	unlock := rm.lockUser(ctx, uid)
 	defer unlock()
-
-	repoFragment, root, err := rm.checkSliceSignature(ctx, did, carslice)
-	_ = repoFragment // TODO: cleanup bolson 2025
-	_ = root         // TODO: cleanup bolson 2025
+	_, _, err := rm.checkSliceSignature(ctx, user.GetDid(), commit.Blocks)
 	if err != nil {
 		return err
 	}
-	//
-	//evtops := make([]RepoOp, 0, len(ops))
-	//for _, op := range ops {
-	//	parts := strings.SplitN(op.Path, "/", 2)
-	//	if len(parts) != 2 {
-	//		return fmt.Errorf("invalid rpath in mst diff, must have collection and rkey")
-	//	}
-	//
-	//	switch EventKind(op.Action) {
-	//	case EvtKindCreateRecord:
-	//		rop := RepoOp{
-	//			Kind:       EvtKindCreateRecord,
-	//			Collection: parts[0],
-	//			Rkey:       parts[1],
-	//			RecCid:     (*cid.Cid)(op.Cid),
-	//		}
-	//
-	//		evtops = append(evtops, rop)
-	//	case EvtKindUpdateRecord:
-	//		rop := RepoOp{
-	//			Kind:       EvtKindUpdateRecord,
-	//			Collection: parts[0],
-	//			Rkey:       parts[1],
-	//			RecCid:     (*cid.Cid)(op.Cid),
-	//		}
-	//
-	//		evtops = append(evtops, rop)
-	//	case EvtKindDeleteRecord:
-	//		evtops = append(evtops, RepoOp{
-	//			Kind:       EvtKindDeleteRecord,
-	//			Collection: parts[0],
-	//			Rkey:       parts[1],
-	//		})
-	//	default:
-	//		return fmt.Errorf("unrecognized external user event kind: %q", op.Action)
-	//	}
-	//}
-
+	if rm.events != nil {
+		xe := &events.XRPCStreamEvent{
+			RepoCommit: commit,
+			PrivUid:    uid,
+		}
+		err = rm.events.AddEvent(ctx, xe)
+		if err != nil {
+			rm.log.Error("events handle commit", "err", err)
+		}
+	}
 	return nil
 }
-
-func (rm *RepoManager) processOp(ctx context.Context, bs blockstore.Blockstore, op *mst.DiffOp, hydrateRecords bool) (*RepoOp, error) {
-	parts := strings.SplitN(op.Rpath, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("repo mst had invalid rpath: %q", op.Rpath)
-	}
-
-	switch op.Op {
-	case "add", "mut":
-
-		kind := EvtKindCreateRecord
-		if op.Op == "mut" {
-			kind = EvtKindUpdateRecord
-		}
-
-		outop := &RepoOp{
-			Kind:       kind,
-			Collection: parts[0],
-			Rkey:       parts[1],
-			RecCid:     &op.NewCid,
-		}
-
-		if hydrateRecords {
-			blk, err := bs.Get(ctx, op.NewCid)
-			if err != nil {
-				return nil, err
-			}
-
-			rec, err := lexutil.CborDecodeValue(blk.RawData())
-			if err != nil {
-				if !errors.Is(err, lexutil.ErrUnrecognizedType) {
-					return nil, err
-				}
-
-				rm.log.Warn("failed processing repo diff", "err", err)
-			} else {
-				outop.Record = rec
-			}
-		}
-
-		return outop, nil
-	case "del":
-		return &RepoOp{
-			Kind:       EvtKindDeleteRecord,
-			Collection: parts[0],
-			Rkey:       parts[1],
-			RecCid:     nil,
-		}, nil
-
-	default:
-		return nil, fmt.Errorf("diff returned invalid op type: %q", op.Op)
-	}
-}
-
-//
-//// walkTree returns all cids linked recursively by the root, skipping any cids
-//// in the 'skip' map, and not erroring on 'not found' if prevMissing is set
-//func (rm *RepoManager) walkTree(ctx context.Context, skip map[cid.Cid]bool, root cid.Cid, bs blockstore.Blockstore, prevMissing bool) ([]cid.Cid, error) {
-//	// TODO: what if someone puts non-cbor links in their repo?
-//	if root.Prefix().Codec != cid.DagCBOR {
-//		return nil, fmt.Errorf("can only handle dag-cbor objects in repos (%s is %d)", root, root.Prefix().Codec)
-//	}
-//
-//	blk, err := bs.Get(ctx, root)
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	var links []cid.Cid
-//	if err := cbg.ScanForLinks(bytes.NewReader(blk.RawData()), func(c cid.Cid) {
-//		if c.Prefix().Codec == cid.Raw {
-//			rm.log.Debug("skipping 'raw' CID in record", "recordCid", root, "rawCid", c)
-//			return
-//		}
-//		if skip[c] {
-//			return
-//		}
-//
-//		links = append(links, c)
-//		skip[c] = true
-//
-//		return
-//	}); err != nil {
-//		return nil, err
-//	}
-//
-//	out := []cid.Cid{root}
-//	skip[root] = true
-//
-//	// TODO: should do this non-recursive since i expect these may get deep
-//	for _, c := range links {
-//		sub, err := rm.walkTree(ctx, skip, c, bs, prevMissing)
-//		if err != nil {
-//			if prevMissing && !ipld.IsNotFound(err) {
-//				return nil, err
-//			}
-//		}
-//
-//		out = append(out, sub...)
-//	}
-//
-//	return out, nil
-//}

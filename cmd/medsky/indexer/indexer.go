@@ -4,20 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"time"
-
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/events"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/notifs"
-	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/xrpc"
+	"log/slog"
 
-	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 )
 
@@ -68,56 +62,6 @@ func (ix *Indexer) HandleCommit(ctx context.Context, host *models.PDS, uid model
 	if err := ix.events.AddEvent(ctx, xe); err != nil {
 		return fmt.Errorf("failed to push event: %s", err)
 	}
-	return nil
-}
-
-func (ix *Indexer) HandleRepoEvent(ctx context.Context, evt *repomgr.RepoEvent) error {
-	ctx, span := otel.Tracer("indexer").Start(ctx, "HandleRepoEvent")
-	defer span.End()
-
-	ix.log.Debug("Handling Repo Event!", "uid", evt.User)
-
-	outops := make([]*comatproto.SyncSubscribeRepos_RepoOp, 0, len(evt.Ops))
-	for _, op := range evt.Ops {
-		link := (*lexutil.LexLink)(op.RecCid)
-		outops = append(outops, &comatproto.SyncSubscribeRepos_RepoOp{
-			Path:   op.Collection + "/" + op.Rkey,
-			Action: string(op.Kind),
-			Cid:    link,
-		})
-	}
-
-	did, err := ix.DidForUser(ctx, evt.User)
-	if err != nil {
-		return err
-	}
-
-	toobig := false
-	slice := evt.RepoSlice
-	if len(slice) > MaxEventSliceLength || len(outops) > MaxOpsSliceLength {
-		slice = []byte{}
-		outops = nil
-		toobig = true
-	}
-
-	ix.log.Debug("Sending event", "did", did)
-	if err := ix.events.AddEvent(ctx, &events.XRPCStreamEvent{
-		RepoCommit: &comatproto.SyncSubscribeRepos_Commit{
-			Repo:   did,
-			Prev:   (*lexutil.LexLink)(evt.OldRoot),
-			Blocks: slice,
-			Rev:    evt.Rev,
-			Since:  evt.Since,
-			Commit: lexutil.LexLink(evt.NewRoot),
-			Time:   time.Now().Format(util.ISO8601),
-			Ops:    outops,
-			TooBig: toobig,
-		},
-		PrivUid: evt.User,
-	}); err != nil {
-		return fmt.Errorf("failed to push event: %s", err)
-	}
-
 	return nil
 }
 
