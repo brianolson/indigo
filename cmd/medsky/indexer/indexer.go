@@ -60,6 +60,17 @@ func NewIndexer(db *gorm.DB, notifman notifs.NotificationManager, evtman *events
 func (ix *Indexer) Shutdown() {
 }
 
+func (ix *Indexer) HandleCommit(ctx context.Context, host *models.PDS, uid models.Uid, did string, commit *comatproto.SyncSubscribeRepos_Commit) error {
+	xe := &events.XRPCStreamEvent{
+		RepoCommit: commit,
+		PrivUid:    uid,
+	}
+	if err := ix.events.AddEvent(ctx, xe); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+	return nil
+}
+
 func (ix *Indexer) HandleRepoEvent(ctx context.Context, evt *repomgr.RepoEvent) error {
 	ctx, span := otel.Tracer("indexer").Start(ctx, "HandleRepoEvent")
 	defer span.End()
@@ -110,37 +121,6 @@ func (ix *Indexer) HandleRepoEvent(ctx context.Context, evt *repomgr.RepoEvent) 
 	return nil
 }
 
-func (ix *Indexer) GetUserOrMissing(ctx context.Context, did string) (*models.ActorInfo, error) {
-	ctx, span := otel.Tracer("indexer").Start(ctx, "getUserOrMissing")
-	defer span.End()
-
-	ai, err := ix.LookupUserByDid(ctx, did)
-	if err == nil {
-		return ai, nil
-	}
-
-	if !isNotFound(err) {
-		return nil, err
-	}
-
-	// unknown user... create it and send it off to the crawler
-	return ix.createMissingUserRecord(ctx, did)
-}
-
-func (ix *Indexer) createMissingUserRecord(ctx context.Context, did string) (*models.ActorInfo, error) {
-	ctx, span := otel.Tracer("indexer").Start(ctx, "createMissingUserRecord")
-	defer span.End()
-
-	externalUserCreationAttempts.Inc()
-
-	ai, err := ix.CreateExternalUser(ctx, did)
-	if err != nil {
-		return nil, err
-	}
-
-	return ai, nil
-}
-
 func (ix *Indexer) DidForUser(ctx context.Context, uid models.Uid) (string, error) {
 	var ai models.ActorInfo
 	if err := ix.db.First(&ai, "uid = ?", uid).Error; err != nil {
@@ -150,31 +130,9 @@ func (ix *Indexer) DidForUser(ctx context.Context, uid models.Uid) (string, erro
 	return ai.Did, nil
 }
 
-func (ix *Indexer) LookupUser(ctx context.Context, id models.Uid) (*models.ActorInfo, error) {
-	var ai models.ActorInfo
-	if err := ix.db.First(&ai, "uid = ?", id).Error; err != nil {
-		return nil, err
-	}
-
-	return &ai, nil
-}
-
 func (ix *Indexer) LookupUserByDid(ctx context.Context, did string) (*models.ActorInfo, error) {
 	var ai models.ActorInfo
 	if err := ix.db.Find(&ai, "did = ?", did).Error; err != nil {
-		return nil, err
-	}
-
-	if ai.ID == 0 {
-		return nil, gorm.ErrRecordNotFound
-	}
-
-	return &ai, nil
-}
-
-func (ix *Indexer) LookupUserByHandle(ctx context.Context, handle string) (*models.ActorInfo, error) {
-	var ai models.ActorInfo
-	if err := ix.db.Find(&ai, "handle = ?", handle).Error; err != nil {
 		return nil, err
 	}
 

@@ -34,9 +34,8 @@ func NewRepoManager(kmgr *KeyManager) *RepoManager {
 	}
 }
 
-func (rm *RepoManager) SetEventHandler(cb func(context.Context, *RepoEvent), hydrateRecords bool) {
-	rm.events = cb
-	rm.hydrateRecords = hydrateRecords
+func (rm *RepoManager) SetNext(next NextCommitHandler) {
+	rm.next = next
 }
 
 type RepoManager struct {
@@ -45,11 +44,14 @@ type RepoManager struct {
 	lklk      sync.Mutex
 	userLocks map[models.Uid]*userLock
 
-	events         func(context.Context, *RepoEvent)
-	hydrateRecords bool
+	next NextCommitHandler
 
 	log       *slog.Logger
 	noArchive bool
+}
+
+type NextCommitHandler interface {
+	HandleCommit(ctx context.Context, host *models.PDS, uid models.Uid, did string, commit *atproto.SyncSubscribeRepos_Commit) error
 }
 
 type ActorInfo struct {
@@ -178,6 +180,10 @@ var _ cbor.IpldBlockstore = &mapIpldBlockstore{}
 // parse car slice, check signature, return repo fragment accessor
 // TODO: rename
 func (rm *RepoManager) checkSliceSignature(ctx context.Context, repoDid string, carslice []byte) (repoFragment *repo.Repo, root cid.Cid, err error) {
+	return checkSliceSignature(ctx, rm.kmgr, repoDid, carslice)
+}
+
+func checkSliceSignature(ctx context.Context, kmgr *KeyManager, repoDid string, carslice []byte) (repoFragment *repo.Repo, root cid.Cid, err error) {
 	carr, err := car.NewCarReader(bytes.NewReader(carslice))
 	if err != nil {
 		return nil, root, err
@@ -210,7 +216,7 @@ func (rm *RepoManager) checkSliceSignature(ctx context.Context, repoDid string, 
 	if err != nil {
 		return nil, root, fmt.Errorf("commit serialization failed: %w", err)
 	}
-	if err := rm.kmgr.VerifyUserSignature(ctx, repoDid, sc.Sig, sb); err != nil {
+	if err := kmgr.VerifyUserSignature(ctx, repoDid, sc.Sig, sb); err != nil {
 		return nil, root, fmt.Errorf("signature check failed (sig: %x) (sb: %x) : %w", sc.Sig, sb, err)
 	}
 
@@ -224,12 +230,27 @@ func (rm *RepoManager) checkSliceSignature(ctx context.Context, repoDid string, 
 	return carepo, root, nil
 }
 
-// TODO: move this to its own thing out of repomgr
-func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, uid models.Uid, did string, since *string, nrev string, carslice []byte, ops []*atproto.SyncSubscribeRepos_RepoOp) error {
-	return rm.handleExternalUserEventNoArchive(ctx, pdsid, uid, did, since, nrev, carslice, ops)
+type IUser interface {
+	GetUid() models.Uid
+	GetDid() string
 }
 
-func (rm *RepoManager) handleExternalUserEventNoArchive(ctx context.Context, pdsid uint, uid models.Uid, did string, since *string, nrev string, carslice []byte, ops []*atproto.SyncSubscribeRepos_RepoOp) error {
+// TODO: move this to its own thing out of repomgr
+func (rm *RepoManager) HandleCommit(ctx context.Context, host *models.PDS, user IUser, commit *atproto.SyncSubscribeRepos_Commit) error {
+	err := rm.HandleExternalUserEvent(ctx, host.ID, user.GetUid(), user.GetDid(), commit.Since, commit.Rev, commit.Blocks, commit.Ops)
+	if err != nil {
+		return err
+	}
+	if rm.next != nil {
+		err = rm.next.HandleCommit(ctx, host, user.GetUid(), user.GetDid(), commit)
+		if err != nil {
+			rm.log.Error("next handle commit", "err", err)
+		}
+	}
+	return nil
+}
+
+func (rm *RepoManager) HandleExternalUserEvent(ctx context.Context, pdsid uint, uid models.Uid, did string, since *string, nrev string, carslice []byte, ops []*atproto.SyncSubscribeRepos_RepoOp) error {
 	ctx, span := otel.Tracer("repoman").Start(ctx, "HandleExternalUserEvent")
 	defer span.End()
 
@@ -241,76 +262,48 @@ func (rm *RepoManager) handleExternalUserEventNoArchive(ctx context.Context, pds
 	defer unlock()
 
 	repoFragment, root, err := rm.checkSliceSignature(ctx, did, carslice)
+	_ = repoFragment // TODO: cleanup bolson 2025
+	_ = root         // TODO: cleanup bolson 2025
 	if err != nil {
 		return err
 	}
-
-	evtops := make([]RepoOp, 0, len(ops))
-	for _, op := range ops {
-		parts := strings.SplitN(op.Path, "/", 2)
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid rpath in mst diff, must have collection and rkey")
-		}
-
-		switch EventKind(op.Action) {
-		case EvtKindCreateRecord:
-			rop := RepoOp{
-				Kind:       EvtKindCreateRecord,
-				Collection: parts[0],
-				Rkey:       parts[1],
-				RecCid:     (*cid.Cid)(op.Cid),
-			}
-
-			if rm.hydrateRecords {
-				_, rec, err := repoFragment.GetRecord(ctx, op.Path)
-				if err != nil {
-					return fmt.Errorf("reading changed record from car slice: %w", err)
-				}
-				rop.Record = rec
-			}
-
-			evtops = append(evtops, rop)
-		case EvtKindUpdateRecord:
-			rop := RepoOp{
-				Kind:       EvtKindUpdateRecord,
-				Collection: parts[0],
-				Rkey:       parts[1],
-				RecCid:     (*cid.Cid)(op.Cid),
-			}
-
-			if rm.hydrateRecords {
-				_, rec, err := repoFragment.GetRecord(ctx, op.Path)
-				if err != nil {
-					return fmt.Errorf("reading changed record from car slice: %w", err)
-				}
-
-				rop.Record = rec
-			}
-
-			evtops = append(evtops, rop)
-		case EvtKindDeleteRecord:
-			evtops = append(evtops, RepoOp{
-				Kind:       EvtKindDeleteRecord,
-				Collection: parts[0],
-				Rkey:       parts[1],
-			})
-		default:
-			return fmt.Errorf("unrecognized external user event kind: %q", op.Action)
-		}
-	}
-
-	if rm.events != nil {
-		rm.events(ctx, &RepoEvent{
-			User: uid,
-			//OldRoot:   prev,
-			NewRoot:   root,
-			Rev:       nrev,
-			Since:     since,
-			Ops:       evtops,
-			RepoSlice: carslice,
-			PDS:       pdsid,
-		})
-	}
+	//
+	//evtops := make([]RepoOp, 0, len(ops))
+	//for _, op := range ops {
+	//	parts := strings.SplitN(op.Path, "/", 2)
+	//	if len(parts) != 2 {
+	//		return fmt.Errorf("invalid rpath in mst diff, must have collection and rkey")
+	//	}
+	//
+	//	switch EventKind(op.Action) {
+	//	case EvtKindCreateRecord:
+	//		rop := RepoOp{
+	//			Kind:       EvtKindCreateRecord,
+	//			Collection: parts[0],
+	//			Rkey:       parts[1],
+	//			RecCid:     (*cid.Cid)(op.Cid),
+	//		}
+	//
+	//		evtops = append(evtops, rop)
+	//	case EvtKindUpdateRecord:
+	//		rop := RepoOp{
+	//			Kind:       EvtKindUpdateRecord,
+	//			Collection: parts[0],
+	//			Rkey:       parts[1],
+	//			RecCid:     (*cid.Cid)(op.Cid),
+	//		}
+	//
+	//		evtops = append(evtops, rop)
+	//	case EvtKindDeleteRecord:
+	//		evtops = append(evtops, RepoOp{
+	//			Kind:       EvtKindDeleteRecord,
+	//			Collection: parts[0],
+	//			Rkey:       parts[1],
+	//		})
+	//	default:
+	//		return fmt.Errorf("unrecognized external user event kind: %q", op.Action)
+	//	}
+	//}
 
 	return nil
 }

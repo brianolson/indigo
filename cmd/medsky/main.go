@@ -460,11 +460,12 @@ func runBigsky(cctx *cli.Context) error {
 		}
 	}
 
-	repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
-		if err := ix.HandleRepoEvent(ctx, evt); err != nil {
-			slog.Error("failed to handle repo event", "err", err)
-		}
-	}, false)
+	//repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
+	//	if err := ix.HandleRepoEvent(ctx, evt); err != nil {
+	//		slog.Error("failed to handle repo event", "err", err)
+	//	}
+	//})
+	repoman.SetNext(ix)
 
 	prodHR, err := api.NewProdHandleResolver(100_000, cctx.String("resolve-address"), cctx.Bool("force-dns-udp"))
 	if err != nil {

@@ -22,7 +22,6 @@ func (s *BGS) RegisterHandlersAppBsky(e *echo.Echo) error {
 func (s *BGS) RegisterHandlersComAtproto(e *echo.Echo) error {
 	e.GET("/xrpc/com.atproto.sync.getLatestCommit", s.HandleComAtprotoSyncGetLatestCommit)
 	e.GET("/xrpc/com.atproto.sync.listRepos", s.HandleComAtprotoSyncListRepos)
-	e.POST("/xrpc/com.atproto.sync.notifyOfUpdate", s.HandleComAtprotoSyncNotifyOfUpdate)
 	e.POST("/xrpc/com.atproto.sync.requestCrawl", s.HandleComAtprotoSyncRequestCrawl)
 	return nil
 }
@@ -77,23 +76,6 @@ func (s *BGS) HandleComAtprotoSyncListRepos(c echo.Context) error {
 		return handleErr
 	}
 	return c.JSON(200, out)
-}
-
-func (s *BGS) HandleComAtprotoSyncNotifyOfUpdate(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncNotifyOfUpdate")
-	defer span.End()
-
-	var body comatprototypes.SyncNotifyOfUpdate_Input
-	if err := c.Bind(&body); err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid body: %s", err)})
-	}
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncNotifyOfUpdate(ctx context.Context,body *comatprototypes.SyncNotifyOfUpdate_Input) error
-	handleErr = s.handleComAtprotoSyncNotifyOfUpdate(ctx, &body)
-	if handleErr != nil {
-		return handleErr
-	}
-	return nil
 }
 
 func (s *BGS) HandleComAtprotoSyncRequestCrawl(c echo.Context) error {
