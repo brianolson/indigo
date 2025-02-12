@@ -95,6 +95,12 @@ type activeSub struct {
 	cancel func()
 }
 
+func (sub *activeSub) updateCursor(curs int64) {
+	sub.lk.Lock()
+	defer sub.lk.Unlock()
+	sub.pds.Cursor = curs
+}
+
 func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, error) {
 	if opts == nil {
 		opts = DefaultSlurperOptions()
@@ -563,14 +569,12 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = evt.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
 		RepoHandle: func(evt *comatproto.SyncSubscribeRepos_Handle) error {
-			log.Info("got remote handle update event", "pdsHost", host.Host, "did", evt.Did, "handle", evt.Handle)
+			log.Debug("got remote handle update event", "pdsHost", host.Host, "did", evt.Did, "handle", evt.Handle)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoHandle: evt,
 			}); err != nil {
@@ -578,14 +582,12 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = evt.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
 		RepoMigrate: func(evt *comatproto.SyncSubscribeRepos_Migrate) error {
-			log.Info("got remote repo migrate event", "pdsHost", host.Host, "did", evt.Did, "migrateTo", evt.MigrateTo)
+			log.Debug("got remote repo migrate event", "pdsHost", host.Host, "did", evt.Did, "migrateTo", evt.MigrateTo)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoMigrate: evt,
 			}); err != nil {
@@ -593,14 +595,12 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = evt.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
 		RepoTombstone: func(evt *comatproto.SyncSubscribeRepos_Tombstone) error {
-			log.Info("got remote repo tombstone event", "pdsHost", host.Host, "did", evt.Did)
+			log.Debug("got remote repo tombstone event", "pdsHost", host.Host, "did", evt.Did)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoTombstone: evt,
 			}); err != nil {
@@ -608,18 +608,16 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = evt.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
 		RepoInfo: func(info *comatproto.SyncSubscribeRepos_Info) error {
-			log.Info("info event", "name", info.Name, "message", info.Message, "pdsHost", host.Host)
+			log.Debug("info event", "name", info.Name, "message", info.Message, "pdsHost", host.Host)
 			return nil
 		},
 		RepoIdentity: func(ident *comatproto.SyncSubscribeRepos_Identity) error {
-			log.Info("identity event", "did", ident.Did)
+			log.Debug("identity event", "did", ident.Did)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoIdentity: ident,
 			}); err != nil {
@@ -627,14 +625,12 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = ident.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
 		RepoAccount: func(acct *comatproto.SyncSubscribeRepos_Account) error {
-			log.Info("account event", "did", acct.Did, "status", acct.Status)
+			log.Debug("account event", "did", acct.Did, "status", acct.Status)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoAccount: acct,
 			}); err != nil {
@@ -642,9 +638,7 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			}
 			*lastCursor = acct.Seq
 
-			if err := s.updateCursor(sub, *lastCursor); err != nil {
-				return fmt.Errorf("updating cursor: %w", err)
-			}
+			sub.updateCursor(*lastCursor)
 
 			return nil
 		},
@@ -682,13 +676,6 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 		instrumentedRSC.EventHandler,
 	)
 	return events.HandleRepoStream(ctx, con, pool, nil)
-}
-
-func (s *Slurper) updateCursor(sub *activeSub, curs int64) error {
-	sub.lk.Lock()
-	defer sub.lk.Unlock()
-	sub.pds.Cursor = curs
-	return nil
 }
 
 type cursorSnapshot struct {

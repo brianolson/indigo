@@ -16,7 +16,6 @@ import (
 
 	"github.com/bluesky-social/indigo/api"
 	libbgs "github.com/bluesky-social/indigo/cmd/medsky/bgs"
-	//"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/cmd/medsky/indexer"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
@@ -98,11 +97,6 @@ func run(args []string) error {
 		&cli.BoolFlag{
 			Name:  "crawl-insecure-ws",
 			Usage: "when connecting to PDS instances, use ws:// instead of wss://",
-		},
-		&cli.BoolFlag{
-			Name:    "spidering",
-			Value:   false,
-			EnvVars: []string{"RELAY_SPIDERING", "BGS_SPIDERING"},
 		},
 		&cli.StringFlag{
 			Name:  "api-listen",
@@ -453,10 +447,7 @@ func runBigsky(cctx *cli.Context) error {
 
 	notifman := &notifs.NullNotifs{}
 
-	// TODO: repo fetcher may entirely go away
-	rf := indexer.NewRepoFetcher(db, repoman, cctx.Int("max-fetch-concurrency"))
-
-	ix, err := indexer.NewIndexer(db, notifman, evtman, cachedidr, rf, true, false, cctx.Bool("spidering"))
+	ix, err := indexer.NewIndexer(db, notifman, evtman, cachedidr)
 	if err != nil {
 		return err
 	}
@@ -479,7 +470,6 @@ func runBigsky(cctx *cli.Context) error {
 			c.Client.Timeout = time.Minute * 1
 		}
 	}
-	rf.ApplyPDSClientSettings = ix.ApplyPDSClientSettings
 
 	repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
 		if err := ix.HandleRepoEvent(ctx, evt); err != nil {
@@ -528,7 +518,7 @@ func runBigsky(cctx *cli.Context) error {
 		}
 		bgsConfig.NextCrawlers = nextCrawlerUrls
 	}
-	bgs, err := libbgs.NewBGS(db, ix, repoman, evtman, cachedidr, rf, hr, bgsConfig)
+	bgs, err := libbgs.NewBGS(db, ix, repoman, evtman, cachedidr, hr, bgsConfig)
 	if err != nil {
 		return err
 	}

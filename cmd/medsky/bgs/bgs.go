@@ -3,9 +3,9 @@ package bgs
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/bluesky-social/indigo/carstore"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,20 +21,16 @@ import (
 	"github.com/bluesky-social/indigo/api"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/carstore"
+	//"github.com/bluesky-social/indigo/carstore"
+	"github.com/bluesky-social/indigo/cmd/medsky/indexer"
+	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/indexer"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
-	"github.com/bluesky-social/indigo/repomgr"
 	"github.com/bluesky-social/indigo/xrpc"
-	lru "github.com/hashicorp/golang-lru/v2"
-	"golang.org/x/sync/semaphore"
-	"golang.org/x/time/rate"
-
 	"github.com/gorilla/websocket"
-	"github.com/ipfs/go-cid"
+	lru "github.com/hashicorp/golang-lru/v2"
 	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -56,12 +52,11 @@ var tracer = otel.Tracer("bgs")
 const serverListenerBootTimeout = 5 * time.Second
 
 type BGS struct {
-	Index       *indexer.Indexer
-	db          *gorm.DB
-	slurper     *Slurper
-	events      *events.EventManager
-	didr        did.Resolver
-	repoFetcher *indexer.RepoFetcher
+	Index   *indexer.Indexer
+	db      *gorm.DB
+	slurper *Slurper
+	events  *events.EventManager
+	didr    did.Resolver
 
 	hr api.HandleResolver
 
@@ -82,12 +77,9 @@ type BGS struct {
 	nextConsumerID uint64
 	consumers      map[uint64]*SocketConsumer
 
-	// Management of Resyncs
-	pdsResyncsLk sync.RWMutex
-	pdsResyncs   map[uint]*PDSResync
-
-	// Management of Compaction
-	compactor *Compactor
+	//// Management of Resyncs
+	//pdsResyncsLk sync.RWMutex
+	//pdsResyncs   map[uint]*PDSResync
 
 	// User cache
 	userCache *lru.Cache[string, *User]
@@ -99,15 +91,15 @@ type BGS struct {
 	log *slog.Logger
 }
 
-type PDSResync struct {
-	PDS              models.PDS `json:"pds"`
-	NumRepoPages     int        `json:"numRepoPages"`
-	NumRepos         int        `json:"numRepos"`
-	NumReposChecked  int        `json:"numReposChecked"`
-	NumReposToResync int        `json:"numReposToResync"`
-	Status           string     `json:"status"`
-	StatusChangedAt  time.Time  `json:"statusChangedAt"`
-}
+//type PDSResync struct {
+//	PDS              models.PDS `json:"pds"`
+//	NumRepoPages     int        `json:"numRepoPages"`
+//	NumRepos         int        `json:"numRepos"`
+//	NumReposChecked  int        `json:"numReposChecked"`
+//	NumReposToResync int        `json:"numReposToResync"`
+//	Status           string     `json:"status"`
+//	StatusChangedAt  time.Time  `json:"statusChangedAt"`
+//}
 
 type SocketConsumer struct {
 	UserAgent   string
@@ -117,12 +109,10 @@ type SocketConsumer struct {
 }
 
 type BGSConfig struct {
-	SSL                  bool
-	CompactInterval      time.Duration
-	DefaultRepoLimit     int64
-	ConcurrencyPerPDS    int64
-	MaxQueuePerPDS       int64
-	NumCompactionWorkers int
+	SSL               bool
+	DefaultRepoLimit  int64
+	ConcurrencyPerPDS int64
+	MaxQueuePerPDS    int64
 
 	// NextCrawlers gets forwarded POST /xrpc/com.atproto.sync.requestCrawl
 	NextCrawlers []*url.URL
@@ -130,16 +120,14 @@ type BGSConfig struct {
 
 func DefaultBGSConfig() *BGSConfig {
 	return &BGSConfig{
-		SSL:                  true,
-		CompactInterval:      4 * time.Hour,
-		DefaultRepoLimit:     100,
-		ConcurrencyPerPDS:    100,
-		MaxQueuePerPDS:       1_000,
-		NumCompactionWorkers: 2,
+		SSL:               true,
+		DefaultRepoLimit:  100,
+		ConcurrencyPerPDS: 100,
+		MaxQueuePerPDS:    1_000,
 	}
 }
 
-func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtman *events.EventManager, didr did.Resolver, rf *indexer.RepoFetcher, hr api.HandleResolver, config *BGSConfig) (*BGS, error) {
+func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtman *events.EventManager, didr did.Resolver, hr api.HandleResolver, config *BGSConfig) (*BGS, error) {
 
 	if config == nil {
 		config = DefaultBGSConfig()
@@ -152,9 +140,8 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 	uc, _ := lru.New[string, *User](1_000_000)
 
 	bgs := &BGS{
-		Index:       ix,
-		db:          db,
-		repoFetcher: rf,
+		Index: ix,
+		db:    db,
 
 		hr:      hr,
 		repoman: repoman,
@@ -165,7 +152,7 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		consumersLk: sync.RWMutex{},
 		consumers:   make(map[uint64]*SocketConsumer),
 
-		pdsResyncs: make(map[uint]*PDSResync),
+		//pdsResyncs: make(map[uint]*PDSResync),
 
 		userCache: uc,
 
@@ -189,13 +176,6 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		return nil, err
 	}
 
-	cOpts := DefaultCompactorOptions()
-	cOpts.NumWorkers = config.NumCompactionWorkers
-	compactor := NewCompactor(cOpts)
-	compactor.requeueInterval = config.CompactInterval
-	compactor.Start(bgs)
-	bgs.compactor = compactor
-
 	bgs.nextCrawlers = config.NextCrawlers
 	bgs.httpClient.Timeout = time.Second * 5
 
@@ -204,95 +184,6 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 
 func (bgs *BGS) StartMetrics(listen string) error {
 	http.Handle("/metrics", promhttp.Handler())
-	return http.ListenAndServe(listen, nil)
-}
-
-// Disabled for now, maybe reimplement behind admin auth later
-func (bgs *BGS) StartDebug(listen string) error {
-	http.HandleFunc("/repodbg/user", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-
-		u, err := bgs.Index.LookupUserByDid(ctx, did)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		root, err := bgs.repoman.GetRepoRoot(ctx, u.Uid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		out := map[string]any{
-			"root":      root.String(),
-			"actorInfo": u,
-		}
-
-		if r.FormValue("carstore") != "" {
-			stat, err := bgs.repoman.CarStore().Stat(ctx, u.Uid)
-			if err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-			out["carstore"] = stat
-		}
-
-		json.NewEncoder(w).Encode(out)
-	})
-	http.HandleFunc("/repodbg/crawl", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-
-		act, err := bgs.Index.GetUserOrMissing(ctx, did)
-		if err != nil {
-			w.WriteHeader(500)
-			bgs.log.Error("failed to get user", "err", err)
-			return
-		}
-
-		if err := bgs.Index.Crawler.Crawl(ctx, act); err != nil {
-			w.WriteHeader(500)
-			bgs.log.Error("failed to add user to crawler", "err", err)
-			return
-		}
-	})
-	http.HandleFunc("/repodbg/blocks", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-		c := r.FormValue("cid")
-
-		bcid, err := cid.Decode(c)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		cs := bgs.repoman.CarStore()
-
-		u, err := bgs.Index.LookupUserByDid(ctx, did)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		bs, err := cs.ReadOnlySession(u.Uid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		blk, err := bs.Get(ctx, bcid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		w.WriteHeader(200)
-		w.Write(blk.RawData())
-	})
-
 	return http.ListenAndServe(listen, nil)
 }
 
@@ -365,9 +256,9 @@ func (bgs *BGS) StartWithListener(listen net.Listener) error {
 	// TODO: this API is temporary until we formalize what we want here
 
 	e.GET("/xrpc/com.atproto.sync.subscribeRepos", bgs.EventsHandler)
-	e.GET("/xrpc/com.atproto.sync.getRecord", bgs.HandleComAtprotoSyncGetRecord)
-	e.GET("/xrpc/com.atproto.sync.getRepo", bgs.HandleComAtprotoSyncGetRepo)
-	e.GET("/xrpc/com.atproto.sync.getBlocks", bgs.HandleComAtprotoSyncGetBlocks)
+	//e.GET("/xrpc/com.atproto.sync.getRecord", bgs.HandleComAtprotoSyncGetRecord)
+	//e.GET("/xrpc/com.atproto.sync.getRepo", bgs.HandleComAtprotoSyncGetRepo)
+	//e.GET("/xrpc/com.atproto.sync.getBlocks", bgs.HandleComAtprotoSyncGetBlocks)
 	e.GET("/xrpc/com.atproto.sync.requestCrawl", bgs.HandleComAtprotoSyncRequestCrawl)
 	e.POST("/xrpc/com.atproto.sync.requestCrawl", bgs.HandleComAtprotoSyncRequestCrawl)
 	e.GET("/xrpc/com.atproto.sync.listRepos", bgs.HandleComAtprotoSyncListRepos)
@@ -396,16 +287,10 @@ func (bgs *BGS) StartWithListener(listen net.Listener) error {
 	admin.POST("/repo/takeDown", bgs.handleAdminTakeDownRepo)
 	admin.POST("/repo/reverseTakedown", bgs.handleAdminReverseTakedown)
 	admin.GET("/repo/takedowns", bgs.handleAdminListRepoTakeDowns)
-	admin.POST("/repo/compact", bgs.handleAdminCompactRepo)
-	admin.POST("/repo/compactAll", bgs.handleAdminCompactAllRepos)
-	admin.POST("/repo/reset", bgs.handleAdminResetRepo)
-	admin.POST("/repo/verify", bgs.handleAdminVerifyRepo)
 
 	// PDS-related Admin API
 	admin.POST("/pds/requestCrawl", bgs.handleAdminRequestCrawl)
 	admin.GET("/pds/list", bgs.handleListPDSs)
-	admin.POST("/pds/resync", bgs.handleAdminPostResyncPDS)
-	admin.GET("/pds/resync", bgs.handleAdminGetResyncPDS)
 	admin.POST("/pds/changeLimits", bgs.handleAdminChangePDSRateLimits)
 	admin.POST("/pds/block", bgs.handleBlockPDS)
 	admin.POST("/pds/unblock", bgs.handleUnblockPDS)
@@ -428,8 +313,6 @@ func (bgs *BGS) Shutdown() []error {
 	if err := bgs.events.Shutdown(context.TODO()); err != nil {
 		errs = append(errs, err)
 	}
-
-	bgs.compactor.Shutdown()
 
 	return errs
 }
@@ -960,6 +843,7 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 		}
 
 		if u.GetTombstoned() {
+			// TODO: reevaluate user lifecycle - tombstoned -- bolson 2025
 			span.SetAttributes(attribute.Bool("tombstoned", true))
 			// we've checked the authority of the users PDS, so reinstate the account
 			if err := bgs.db.Model(&User{}).Where("id = ?", u.ID).UpdateColumn("tombstoned", false).Error; err != nil {
@@ -968,53 +852,34 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 			}
 			u.SetTombstoned(false)
 
-			ai, err := bgs.Index.LookupUser(ctx, u.ID)
-			if err != nil {
-				repoCommitsResultCounter.WithLabelValues(host.Host, "nou2").Inc()
-				return fmt.Errorf("failed to look up user (tombstone recover): %w", err)
-			}
+			//ai, err := bgs.Index.LookupUser(ctx, u.ID)
+			//if err != nil {
+			//	repoCommitsResultCounter.WithLabelValues(host.Host, "nou2").Inc()
+			//	return fmt.Errorf("failed to look up user (tombstone recover): %w", err)
+			//}
 
 			// Now a simple re-crawl should suffice to bring the user back online
-			repoCommitsResultCounter.WithLabelValues(host.Host, "catchupt").Inc()
-			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
-		}
-
-		// skip the fast path for rebases or if the user is already in the slow path
-		if bgs.Index.Crawler.RepoInSlowPath(ctx, u.ID) {
-			rebasesCounter.WithLabelValues(host.Host).Add(1)
-			ai, err := bgs.Index.LookupUser(ctx, u.ID)
-			if err != nil {
-				repoCommitsResultCounter.WithLabelValues(host.Host, "nou3").Inc()
-				return fmt.Errorf("failed to look up user (slow path): %w", err)
-			}
-
-			// TODO: we currently do not handle events that get queued up
-			// behind an already 'in progress' slow path event.
-			// this is strictly less efficient than it could be, and while it
-			// does 'work' (due to falling back to resyncing the repo), its
-			// technically incorrect. Now that we have the parallel event
-			// processor coming off of the pds stream, we should investigate
-			// whether or not we even need this 'slow path' logic, as it makes
-			// accounting for which events have been processed much harder
-			repoCommitsResultCounter.WithLabelValues(host.Host, "catchup").Inc()
-			return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+			//repoCommitsResultCounter.WithLabelValues(host.Host, "catchupt").Inc()
+			//return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+			// TODO: fall through and just handle the event and the right thing should happen? -- bolson 2025 unsure
 		}
 
 		if err := bgs.repoman.HandleExternalUserEvent(ctx, host.ID, u.ID, u.Did, evt.Since, evt.Rev, evt.Blocks, evt.Ops); err != nil {
 
 			if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
-				ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
-				if lerr != nil {
-					log.Warn("failed handling event, no user", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
-					repoCommitsResultCounter.WithLabelValues(host.Host, "nou4").Inc()
-					return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
-				}
+				//ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
+				//if lerr != nil {
+				//	log.Warn("failed handling event, no user", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+				//	repoCommitsResultCounter.WithLabelValues(host.Host, "nou4").Inc()
+				//	return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
+				//}
 
-				span.SetAttributes(attribute.Bool("catchup_queue", true))
-
-				log.Info("failed handling event, catchup", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
-				repoCommitsResultCounter.WithLabelValues(host.Host, "catchup2").Inc()
-				return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
+				// TODO: getRepo is obsolete, um, what? -- bolson 2025
+				//span.SetAttributes(attribute.Bool("catchup_queue", true))
+				//
+				//log.Info("failed handling event, catchup", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+				//repoCommitsResultCounter.WithLabelValues(host.Host, "catchup2").Inc()
+				//return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
 			}
 
 			log.Warn("failed handling event", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
@@ -1195,12 +1060,6 @@ func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *a
 		"handle": nil,
 	}).Error; err != nil {
 		return err
-	}
-
-	// delete data from carstore
-	if err := bgs.repoman.TakeDownRepo(ctx, u.ID); err != nil {
-		// don't let a failure here prevent us from propagating this event
-		bgs.log.Error("failed to delete user data from carstore", "err", err)
 	}
 
 	return bgs.events.AddEvent(ctx, &events.XRPCStreamEvent{
@@ -1490,6 +1349,7 @@ func (bgs *BGS) UpdateAccountStatus(ctx context.Context, did string, status stri
 			return err
 		}
 	case events.AccountStatusDeleted:
+		// TODO: tweak model to mark user deleted? -- bolson 2025
 		if err := bgs.db.Model(&User{}).Where("id = ?", u.ID).UpdateColumns(map[string]any{
 			"tombstoned":      true,
 			"handle":          nil,
@@ -1499,16 +1359,11 @@ func (bgs *BGS) UpdateAccountStatus(ctx context.Context, did string, status stri
 		}
 		u.SetUpstreamStatus(events.AccountStatusDeleted)
 
+		// TODO: merge User ActiorInfo -- bolson 2025
 		if err := bgs.db.Model(&models.ActorInfo{}).Where("uid = ?", u.ID).UpdateColumns(map[string]any{
 			"handle": nil,
 		}).Error; err != nil {
 			return err
-		}
-
-		// delete data from carstore
-		if err := bgs.repoman.TakeDownRepo(ctx, u.ID); err != nil {
-			// don't let a failure here prevent us from propagating this event
-			bgs.log.Error("failed to delete user data from carstore", "err", err)
 		}
 	}
 
@@ -1525,10 +1380,6 @@ func (bgs *BGS) TakeDownRepo(ctx context.Context, did string) error {
 		return err
 	}
 	u.SetTakenDown(true)
-
-	if err := bgs.repoman.TakeDownRepo(ctx, u.ID); err != nil {
-		return err
-	}
 
 	if err := bgs.events.TakeDownRepo(ctx, u.ID); err != nil {
 		return err
@@ -1551,189 +1402,64 @@ func (bgs *BGS) ReverseTakedown(ctx context.Context, did string) error {
 	return nil
 }
 
-type revCheckResult struct {
-	ai  *models.ActorInfo
-	err error
-}
-
-func (bgs *BGS) LoadOrStoreResync(pds models.PDS) (PDSResync, bool) {
-	bgs.pdsResyncsLk.Lock()
-	defer bgs.pdsResyncsLk.Unlock()
-
-	if r, ok := bgs.pdsResyncs[pds.ID]; ok && r != nil {
-		return *r, true
-	}
-
-	r := PDSResync{
-		PDS:             pds,
-		Status:          "started",
-		StatusChangedAt: time.Now(),
-	}
-
-	bgs.pdsResyncs[pds.ID] = &r
-
-	return r, false
-}
-
-func (bgs *BGS) GetResync(pds models.PDS) (PDSResync, bool) {
-	bgs.pdsResyncsLk.RLock()
-	defer bgs.pdsResyncsLk.RUnlock()
-
-	if r, ok := bgs.pdsResyncs[pds.ID]; ok {
-		return *r, true
-	}
-
-	return PDSResync{}, false
-}
-
-func (bgs *BGS) UpdateResync(resync PDSResync) {
-	bgs.pdsResyncsLk.Lock()
-	defer bgs.pdsResyncsLk.Unlock()
-
-	bgs.pdsResyncs[resync.PDS.ID] = &resync
-}
-
-func (bgs *BGS) SetResyncStatus(id uint, status string) PDSResync {
-	bgs.pdsResyncsLk.Lock()
-	defer bgs.pdsResyncsLk.Unlock()
-
-	if r, ok := bgs.pdsResyncs[id]; ok {
-		r.Status = status
-		r.StatusChangedAt = time.Now()
-	}
-
-	return *bgs.pdsResyncs[id]
-}
-
-func (bgs *BGS) CompleteResync(resync PDSResync) {
-	bgs.pdsResyncsLk.Lock()
-	defer bgs.pdsResyncsLk.Unlock()
-
-	delete(bgs.pdsResyncs, resync.PDS.ID)
-}
-
-func (bgs *BGS) ResyncPDS(ctx context.Context, pds models.PDS) error {
-	ctx, span := tracer.Start(ctx, "ResyncPDS")
-	defer span.End()
-	log := bgs.log.With("pds", pds.Host, "source", "resync_pds")
-	resync, found := bgs.LoadOrStoreResync(pds)
-	if found {
-		return fmt.Errorf("resync already in progress")
-	}
-	defer bgs.CompleteResync(resync)
-
-	start := time.Now()
-
-	log.Warn("starting PDS resync")
-
-	host := "http://"
-	if pds.SSL {
-		host = "https://"
-	}
-	host += pds.Host
-
-	xrpcc := xrpc.Client{Host: host}
-	bgs.Index.ApplyPDSClientSettings(&xrpcc)
-
-	limiter := rate.NewLimiter(rate.Limit(50), 1)
-	cursor := ""
-	limit := int64(500)
-
-	repos := []comatproto.SyncListRepos_Repo{}
-
-	pages := 0
-
-	resync = bgs.SetResyncStatus(pds.ID, "listing repos")
-	for {
-		pages++
-		if pages%10 == 0 {
-			log.Warn("fetching PDS page during resync", "pages", pages, "total_repos", len(repos))
-			resync.NumRepoPages = pages
-			resync.NumRepos = len(repos)
-			bgs.UpdateResync(resync)
-		}
-		if err := limiter.Wait(ctx); err != nil {
-			log.Error("failed to wait for rate limiter", "error", err)
-			return fmt.Errorf("failed to wait for rate limiter: %w", err)
-		}
-		repoList, err := comatproto.SyncListRepos(ctx, &xrpcc, cursor, limit)
-		if err != nil {
-			log.Error("failed to list repos", "error", err)
-			return fmt.Errorf("failed to list repos: %w", err)
-		}
-
-		for _, r := range repoList.Repos {
-			if r != nil {
-				repos = append(repos, *r)
-			}
-		}
-
-		if repoList.Cursor == nil || *repoList.Cursor == "" {
-			break
-		}
-		cursor = *repoList.Cursor
-	}
-
-	resync.NumRepoPages = pages
-	resync.NumRepos = len(repos)
-	bgs.UpdateResync(resync)
-
-	repolistDone := time.Now()
-
-	log.Warn("listed all repos, checking roots", "num_repos", len(repos), "took", repolistDone.Sub(start))
-	resync = bgs.SetResyncStatus(pds.ID, "checking revs")
-
-	// run loop over repos with some concurrency
-	sem := semaphore.NewWeighted(40)
-
-	// Check repo revs against our local copy and enqueue crawls for any that are out of date
-	for i, r := range repos {
-		if err := sem.Acquire(ctx, 1); err != nil {
-			log.Error("failed to acquire semaphore", "error", err)
-			continue
-		}
-		go func(r comatproto.SyncListRepos_Repo) {
-			defer sem.Release(1)
-			log := bgs.log.With("did", r.Did, "remote_rev", r.Rev)
-			// Fetches the user if we have it, otherwise automatically enqueues it for crawling
-			ai, err := bgs.Index.GetUserOrMissing(ctx, r.Did)
-			if err != nil {
-				log.Error("failed to get user while resyncing PDS, we can't recrawl it", "error", err)
-				return
-			}
-
-			rev, err := bgs.repoman.GetRepoRev(ctx, ai.Uid)
-			if err != nil {
-				log.Warn("recrawling because we failed to get the local repo root", "err", err, "uid", ai.Uid)
-				err := bgs.Index.Crawler.Crawl(ctx, ai)
-				if err != nil {
-					log.Error("failed to enqueue crawl for repo during resync", "error", err, "uid", ai.Uid, "did", ai.Did)
-				}
-				return
-			}
-
-			if rev == "" || rev < r.Rev {
-				log.Warn("recrawling because the repo rev from the PDS is newer than our local repo rev", "local_rev", rev)
-				err := bgs.Index.Crawler.Crawl(ctx, ai)
-				if err != nil {
-					log.Error("failed to enqueue crawl for repo during resync", "error", err, "uid", ai.Uid, "did", ai.Did)
-				}
-				return
-			}
-		}(r)
-		if i%100 == 0 {
-			if i%10_000 == 0 {
-				log.Warn("checked revs during resync", "num_repos_checked", i, "num_repos_to_crawl", -1, "took", time.Now().Sub(resync.StatusChangedAt))
-			}
-			resync.NumReposChecked = i
-			bgs.UpdateResync(resync)
-		}
-	}
-
-	resync.NumReposChecked = len(repos)
-	bgs.UpdateResync(resync)
-
-	bgs.log.Warn("enqueued all crawls, exiting resync", "took", time.Now().Sub(start), "num_repos_to_crawl", -1)
-
-	return nil
-}
+//
+//type revCheckResult struct {
+//	ai  *models.ActorInfo
+//	err error
+//}
+//
+//func (bgs *BGS) LoadOrStoreResync(pds models.PDS) (PDSResync, bool) {
+//	bgs.pdsResyncsLk.Lock()
+//	defer bgs.pdsResyncsLk.Unlock()
+//
+//	if r, ok := bgs.pdsResyncs[pds.ID]; ok && r != nil {
+//		return *r, true
+//	}
+//
+//	r := PDSResync{
+//		PDS:             pds,
+//		Status:          "started",
+//		StatusChangedAt: time.Now(),
+//	}
+//
+//	bgs.pdsResyncs[pds.ID] = &r
+//
+//	return r, false
+//}
+//
+//func (bgs *BGS) GetResync(pds models.PDS) (PDSResync, bool) {
+//	bgs.pdsResyncsLk.RLock()
+//	defer bgs.pdsResyncsLk.RUnlock()
+//
+//	if r, ok := bgs.pdsResyncs[pds.ID]; ok {
+//		return *r, true
+//	}
+//
+//	return PDSResync{}, false
+//}
+//
+//func (bgs *BGS) UpdateResync(resync PDSResync) {
+//	bgs.pdsResyncsLk.Lock()
+//	defer bgs.pdsResyncsLk.Unlock()
+//
+//	bgs.pdsResyncs[resync.PDS.ID] = &resync
+//}
+//
+//func (bgs *BGS) SetResyncStatus(id uint, status string) PDSResync {
+//	bgs.pdsResyncsLk.Lock()
+//	defer bgs.pdsResyncsLk.Unlock()
+//
+//	if r, ok := bgs.pdsResyncs[id]; ok {
+//		r.Status = status
+//		r.StatusChangedAt = time.Now()
+//	}
+//
+//	return *bgs.pdsResyncs[id]
+//}
+//
+//func (bgs *BGS) CompleteResync(resync PDSResync) {
+//	bgs.pdsResyncsLk.Lock()
+//	defer bgs.pdsResyncsLk.Unlock()
+//
+//	delete(bgs.pdsResyncs, resync.PDS.ID)
+//}
