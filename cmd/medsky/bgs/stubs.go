@@ -2,13 +2,11 @@ package bgs
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 
 	comatprototypes "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 	"go.opentelemetry.io/otel"
 )
@@ -22,42 +20,11 @@ func (s *BGS) RegisterHandlersAppBsky(e *echo.Echo) error {
 }
 
 func (s *BGS) RegisterHandlersComAtproto(e *echo.Echo) error {
-	e.GET("/xrpc/com.atproto.sync.getBlocks", s.HandleComAtprotoSyncGetBlocks)
 	e.GET("/xrpc/com.atproto.sync.getLatestCommit", s.HandleComAtprotoSyncGetLatestCommit)
-	e.GET("/xrpc/com.atproto.sync.getRecord", s.HandleComAtprotoSyncGetRecord)
-	e.GET("/xrpc/com.atproto.sync.getRepo", s.HandleComAtprotoSyncGetRepo)
 	e.GET("/xrpc/com.atproto.sync.listRepos", s.HandleComAtprotoSyncListRepos)
 	e.POST("/xrpc/com.atproto.sync.notifyOfUpdate", s.HandleComAtprotoSyncNotifyOfUpdate)
 	e.POST("/xrpc/com.atproto.sync.requestCrawl", s.HandleComAtprotoSyncRequestCrawl)
 	return nil
-}
-
-func (s *BGS) HandleComAtprotoSyncGetBlocks(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncGetBlocks")
-	defer span.End()
-
-	cids := c.QueryParams()["cids"]
-	did := c.QueryParam("did")
-	_, err := syntax.ParseDID(did)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid did: %s", did)})
-	}
-
-	for _, cd := range cids {
-		_, err = cid.Parse(cd)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid cid: %s", cd)})
-		}
-	}
-
-	var out io.Reader
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncGetBlocks(ctx context.Context,cids []string,did string) (io.Reader, error)
-	out, handleErr = s.handleComAtprotoSyncGetBlocks(ctx, cids, did)
-	if handleErr != nil {
-		return handleErr
-	}
-	return c.Stream(200, "application/vnd.ipld.car", out)
 }
 
 func (s *BGS) HandleComAtprotoSyncGetLatestCommit(c echo.Context) error {
@@ -78,59 +45,6 @@ func (s *BGS) HandleComAtprotoSyncGetLatestCommit(c echo.Context) error {
 		return handleErr
 	}
 	return c.JSON(200, out)
-}
-
-func (s *BGS) HandleComAtprotoSyncGetRecord(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncGetRecord")
-	defer span.End()
-	collection := c.QueryParam("collection")
-	did := c.QueryParam("did")
-	rkey := c.QueryParam("rkey")
-
-	_, err := syntax.ParseRecordKey(rkey)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid rkey: %s", rkey)})
-	}
-
-	_, err = syntax.ParseNSID(collection)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid collection: %s", collection)})
-	}
-
-	_, err = syntax.ParseDID(did)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid did: %s", did)})
-	}
-
-	var out io.Reader
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncGetRecord(ctx context.Context,collection string,commit string,did string,rkey string) (io.Reader, error)
-	out, handleErr = s.handleComAtprotoSyncGetRecord(ctx, collection, did, rkey)
-	if handleErr != nil {
-		return handleErr
-	}
-	return c.Stream(200, "application/vnd.ipld.car", out)
-}
-
-func (s *BGS) HandleComAtprotoSyncGetRepo(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncGetRepo")
-	defer span.End()
-	did := c.QueryParam("did")
-	since := c.QueryParam("since")
-
-	_, err := syntax.ParseDID(did)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid did: %s", did)})
-	}
-
-	var out io.Reader
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncGetRepo(ctx context.Context,did string,since string) (io.Reader, error)
-	out, handleErr = s.handleComAtprotoSyncGetRepo(ctx, did, since)
-	if handleErr != nil {
-		return handleErr
-	}
-	return c.Stream(200, "application/vnd.ipld.car", out)
 }
 
 func (s *BGS) HandleComAtprotoSyncListRepos(c echo.Context) error {

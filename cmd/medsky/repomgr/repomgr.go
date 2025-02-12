@@ -24,7 +24,7 @@ import (
 	"sync"
 )
 
-func NewRepoManager(kmgr KeyManager) *RepoManager {
+func NewRepoManager(kmgr *KeyManager) *RepoManager {
 
 	return &RepoManager{
 		userLocks: make(map[models.Uid]*userLock),
@@ -34,18 +34,13 @@ func NewRepoManager(kmgr KeyManager) *RepoManager {
 	}
 }
 
-type KeyManager interface {
-	VerifyUserSignature(context.Context, string, []byte, []byte) error
-	SignForUser(context.Context, string, []byte) ([]byte, error)
-}
-
 func (rm *RepoManager) SetEventHandler(cb func(context.Context, *RepoEvent), hydrateRecords bool) {
 	rm.events = cb
 	rm.hydrateRecords = hydrateRecords
 }
 
 type RepoManager struct {
-	kmgr KeyManager
+	kmgr *KeyManager
 
 	lklk      sync.Mutex
 	userLocks map[models.Uid]*userLock

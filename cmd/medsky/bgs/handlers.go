@@ -6,127 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
 	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatprototypes "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/mst"
 	"gorm.io/gorm"
 
 	"github.com/bluesky-social/indigo/xrpc"
-	"github.com/ipfs/go-cid"
-	cbor "github.com/ipfs/go-ipld-cbor"
-	"github.com/ipld/go-car"
 	"github.com/labstack/echo/v4"
 )
-
-func (s *BGS) handleComAtprotoSyncGetRecord(ctx context.Context, collection string, did string, rkey string) (io.Reader, error) {
-	u, err := s.lookupUserByDid(ctx, did)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, echo.NewHTTPError(http.StatusNotFound, "user not found")
-		}
-		log.Error("failed to lookup user", "err", err, "did", did)
-		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to lookup user")
-	}
-
-	if u.GetTombstoned() {
-		return nil, fmt.Errorf("account was deleted")
-	}
-
-	if u.GetTakenDown() {
-		return nil, fmt.Errorf("account was taken down by the Relay")
-	}
-
-	ustatus := u.GetUpstreamStatus()
-	if ustatus == events.AccountStatusTakendown {
-		return nil, fmt.Errorf("account was taken down by its PDS")
-	}
-
-	if ustatus == events.AccountStatusDeactivated {
-		return nil, fmt.Errorf("account is temporarily deactivated")
-	}
-
-	if ustatus == events.AccountStatusSuspended {
-		return nil, fmt.Errorf("account is suspended by its PDS")
-	}
-
-	root, blocks, err := s.repoman.GetRecordProof(ctx, u.ID, collection, rkey)
-	if err != nil {
-		if errors.Is(err, mst.ErrNotFound) {
-			return nil, echo.NewHTTPError(http.StatusNotFound, "record not found in repo")
-		}
-		log.Error("failed to get record from repo", "err", err, "did", did, "collection", collection, "rkey", rkey)
-		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to get record from repo")
-	}
-
-	buf := new(bytes.Buffer)
-	hb, err := cbor.DumpObject(&car.CarHeader{
-		Roots:   []cid.Cid{root},
-		Version: 1,
-	})
-	if _, err := carstore.LdWrite(buf, hb); err != nil {
-		return nil, err
-	}
-
-	for _, blk := range blocks {
-		if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
-			return nil, err
-		}
-	}
-
-	return buf, nil
-}
-
-func (s *BGS) handleComAtprotoSyncGetRepo(ctx context.Context, did string, since string) (io.Reader, error) {
-	u, err := s.lookupUserByDid(ctx, did)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, echo.NewHTTPError(http.StatusNotFound, "user not found")
-		}
-		log.Error("failed to lookup user", "err", err, "did", did)
-		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to lookup user")
-	}
-
-	if u.GetTombstoned() {
-		return nil, fmt.Errorf("account was deleted")
-	}
-
-	if u.GetTakenDown() {
-		return nil, fmt.Errorf("account was taken down by the Relay")
-	}
-
-	ustatus := u.GetUpstreamStatus()
-	if ustatus == events.AccountStatusTakendown {
-		return nil, fmt.Errorf("account was taken down by its PDS")
-	}
-
-	if ustatus == events.AccountStatusDeactivated {
-		return nil, fmt.Errorf("account is temporarily deactivated")
-	}
-
-	if ustatus == events.AccountStatusSuspended {
-		return nil, fmt.Errorf("account is suspended by its PDS")
-	}
-
-	// TODO: stream the response
-	buf := new(bytes.Buffer)
-	if err := s.repoman.ReadRepo(ctx, u.ID, since, buf); err != nil {
-		log.Error("failed to read repo into buffer", "err", err, "did", did)
-		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to read repo into buffer")
-	}
-
-	return buf, nil
-}
-
-func (s *BGS) handleComAtprotoSyncGetBlocks(ctx context.Context, cids []string, did string) (io.Reader, error) {
-	return nil, fmt.Errorf("NYI")
-}
 
 func (s *BGS) handleComAtprotoSyncRequestCrawl(ctx context.Context, body *comatprototypes.SyncRequestCrawl_Input) error {
 	host := body.Hostname
@@ -250,7 +141,7 @@ func (s *BGS) handleComAtprotoSyncListRepos(ctx context.Context, cursor int64, l
 	for i := range users {
 		user := users[i]
 
-		root, err := s.repoman.GetRepoRoot(ctx, user.ID)
+		root, err := s.GetRepoRoot(ctx, user.ID)
 		if err != nil {
 			log.Error("failed to get repo root", "err", err, "did", user.Did)
 			return nil, echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("failed to get repo root for (%s): %v", user.Did, err.Error()))
@@ -301,13 +192,13 @@ func (s *BGS) handleComAtprotoSyncGetLatestCommit(ctx context.Context, did strin
 		return nil, fmt.Errorf("account is suspended by its PDS")
 	}
 
-	root, err := s.repoman.GetRepoRoot(ctx, u.ID)
+	root, err := s.GetRepoRoot(ctx, u.ID)
 	if err != nil {
 		log.Error("failed to get repo root", "err", err, "did", u.Did)
 		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to get repo root")
 	}
 
-	rev, err := s.repoman.GetRepoRev(ctx, u.ID)
+	rev, err := s.GetRepoRev(ctx, u.ID)
 	if err != nil {
 		log.Error("failed to get repo rev", "err", err, "did", u.Did)
 		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to get repo rev")

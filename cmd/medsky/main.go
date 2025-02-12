@@ -131,12 +131,6 @@ func run(args []string) error {
 			EnvVars: []string{"MAX_METADB_CONNECTIONS"},
 			Value:   40,
 		},
-		&cli.DurationFlag{
-			Name:    "compact-interval",
-			EnvVars: []string{"RELAY_COMPACT_INTERVAL", "BGS_COMPACT_INTERVAL"},
-			Value:   4 * time.Hour,
-			Usage:   "interval between compaction runs, set to 0 to disable scheduled compaction",
-		},
 		&cli.StringFlag{
 			Name:    "resolve-address",
 			EnvVars: []string{"RESOLVE_ADDRESS"},
@@ -195,11 +189,6 @@ func run(args []string) error {
 			Usage:   "time to live for event playback buffering (only applies to disk persister)",
 			EnvVars: []string{"RELAY_EVENT_PLAYBACK_TTL"},
 			Value:   72 * time.Hour,
-		},
-		&cli.IntFlag{
-			Name:    "num-compaction-workers",
-			EnvVars: []string{"RELAY_NUM_COMPACTION_WORKERS"},
-			Value:   2,
 		},
 		//&cli.StringSliceFlag{
 		//	Name:    "carstore-shard-dirs",
@@ -418,7 +407,7 @@ func runBigsky(cctx *cli.Context) error {
 		cachedidr = plc.NewCachingDidResolver(prevResolver, time.Hour*24, cctx.Int("did-cache-size"))
 	}
 
-	kmgr := indexer.NewKeyManager(cachedidr, nil)
+	kmgr := repomgr.NewKeyManager(cachedidr, nil)
 
 	repoman := repomgr.NewRepoManager(kmgr)
 
@@ -500,11 +489,9 @@ func runBigsky(cctx *cli.Context) error {
 	slog.Info("constructing bgs")
 	bgsConfig := libbgs.DefaultBGSConfig()
 	bgsConfig.SSL = !cctx.Bool("crawl-insecure-ws")
-	bgsConfig.CompactInterval = cctx.Duration("compact-interval")
 	bgsConfig.ConcurrencyPerPDS = cctx.Int64("concurrency-per-pds")
 	bgsConfig.MaxQueuePerPDS = cctx.Int64("max-queue-per-pds")
 	bgsConfig.DefaultRepoLimit = cctx.Int64("default-repo-limit")
-	bgsConfig.NumCompactionWorkers = cctx.Int("num-compaction-workers")
 	nextCrawlers := cctx.StringSlice("next-crawler")
 	if len(nextCrawlers) != 0 {
 		nextCrawlerUrls := make([]*url.URL, len(nextCrawlers))

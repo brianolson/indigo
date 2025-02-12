@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/bluesky-social/indigo/carstore"
+	"github.com/ipfs/go-cid"
 	"log/slog"
 	"net"
 	"net/http"
@@ -133,7 +134,7 @@ func NewBGS(db *gorm.DB, ix *indexer.Indexer, repoman *repomgr.RepoManager, evtm
 		config = DefaultBGSConfig()
 	}
 	db.AutoMigrate(User{})
-	db.AutoMigrate(AuthToken{})
+	db.AutoMigrate(AuthToken{}) // TODO: move to more general settings table
 	db.AutoMigrate(models.PDS{})
 	db.AutoMigrate(models.DomainBan{})
 
@@ -427,6 +428,10 @@ type User struct {
 
 	// UpstreamStatus is the state of the user as reported by the upstream PDS
 	UpstreamStatus string `gorm:"index"`
+
+	// Last known root and rev for repo; TODO: add bits needed for induction firehose?
+	Root models.DbCID `gorm:"root"`
+	Rev  string       `gorm:"rev"`
 
 	lk sync.Mutex
 }
@@ -758,6 +763,7 @@ func stringLink(lnk *lexutil.LexLink) string {
 	return lnk.String()
 }
 
+// called from Slurper
 func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
 	ctx, span := tracer.Start(ctx, "handleFedEvent")
 	defer span.End()
@@ -1400,6 +1406,13 @@ func (bgs *BGS) ReverseTakedown(ctx context.Context, did string) error {
 	u.SetTakenDown(false)
 
 	return nil
+}
+
+func (bgs *BGS) GetRepoRoot(ctx context.Context, user models.Uid) (cid.Cid, error) {
+	panic("TODO: WRITEME get last root Cid for a repo")
+}
+func (bgs *BGS) GetRepoRev(ctx context.Context, user models.Uid) (string, error) {
+	panic("TODO: WRITEME get last rev for a repo")
 }
 
 //

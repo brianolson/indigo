@@ -74,10 +74,6 @@ func (ix *Indexer) HandleRepoEvent(ctx context.Context, evt *repomgr.RepoEvent) 
 			Action: string(op.Kind),
 			Cid:    link,
 		})
-
-		if err := ix.handleRepoOp(ctx, evt, &op); err != nil {
-			ix.log.Error("failed to handle repo op", "err", err)
-		}
 	}
 
 	did, err := ix.DidForUser(ctx, evt.User)
@@ -111,33 +107,6 @@ func (ix *Indexer) HandleRepoEvent(ctx context.Context, evt *repomgr.RepoEvent) 
 		return fmt.Errorf("failed to push event: %s", err)
 	}
 
-	return nil
-}
-
-func (ix *Indexer) handleRepoOp(ctx context.Context, evt *repomgr.RepoEvent, op *repomgr.RepoOp) error {
-	switch op.Kind {
-	case repomgr.EvtKindCreateRecord:
-	case repomgr.EvtKindDeleteRecord:
-	case repomgr.EvtKindUpdateRecord:
-	default:
-		return fmt.Errorf("unrecognized repo event type: %q", op.Kind)
-	}
-
-	return nil
-}
-
-func (ix *Indexer) crawlAtUriRef(ctx context.Context, uri string) error {
-	puri, err := util.ParseAtUri(uri)
-	if err != nil {
-		return err
-	}
-
-	referencesCrawled.Inc()
-
-	_, err = ix.GetUserOrMissing(ctx, puri.Did)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
