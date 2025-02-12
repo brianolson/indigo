@@ -139,8 +139,6 @@ func NewBGS(db *gorm.DB, repoman *repomgr.RepoManager, evtman *events.EventManag
 		consumersLk: sync.RWMutex{},
 		consumers:   make(map[uint64]*SocketConsumer),
 
-		//pdsResyncs: make(map[uint]*PDSResync),
-
 		userCache: uc,
 
 		log: slog.Default().With("system", "bgs"),
@@ -1246,13 +1244,6 @@ func (bgs *BGS) createExternalUser(ctx context.Context, did string) (*User, erro
 				return nil, fmt.Errorf("failed to update outdated user's handle: %w", err)
 			}
 
-			// Do the same thing for the ActorInfo if it exists
-			if err := bgs.db.Model(models.ActorInfo{}).Where("uid = ?", existingUser.ID).Update("handle", nil).Update("valid_handle", false).Error; err != nil {
-				if !errors.Is(err, gorm.ErrRecordNotFound) {
-					return nil, fmt.Errorf("failed to update outdated actorInfo's handle: %w", err)
-				}
-			}
-
 			// Create the new user
 			if err := bgs.db.Create(&u).Error; err != nil {
 				return nil, fmt.Errorf("failed to create user after handle conflict: %w", err)
@@ -1305,12 +1296,7 @@ func (bgs *BGS) UpdateAccountStatus(ctx context.Context, did string, status stri
 			return fmt.Errorf("failed to set user taken down status: %w", err)
 		}
 		u.SetUpstreamStatus(events.AccountStatusTakendown)
-
-		if err := bgs.db.Model(&models.ActorInfo{}).Where("uid = ?", u.ID).UpdateColumns(map[string]any{
-			"handle": nil,
-		}).Error; err != nil {
-			return err
-		}
+		// TODO: set User takedown in db? -- bolson 2025
 	case events.AccountStatusDeleted:
 		// TODO: tweak model to mark user deleted? -- bolson 2025
 		if err := bgs.db.Model(&User{}).Where("id = ?", u.ID).UpdateColumns(map[string]any{
@@ -1321,13 +1307,6 @@ func (bgs *BGS) UpdateAccountStatus(ctx context.Context, did string, status stri
 			return err
 		}
 		u.SetUpstreamStatus(events.AccountStatusDeleted)
-
-		// TODO: merge User ActiorInfo -- bolson 2025
-		if err := bgs.db.Model(&models.ActorInfo{}).Where("uid = ?", u.ID).UpdateColumns(map[string]any{
-			"handle": nil,
-		}).Error; err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -1371,65 +1350,3 @@ func (bgs *BGS) GetRepoRoot(ctx context.Context, user models.Uid) (cid.Cid, erro
 func (bgs *BGS) GetRepoRev(ctx context.Context, user models.Uid) (string, error) {
 	panic("TODO: WRITEME get last rev for a repo")
 }
-
-//
-//type revCheckResult struct {
-//	ai  *models.ActorInfo
-//	err error
-//}
-//
-//func (bgs *BGS) LoadOrStoreResync(pds models.PDS) (PDSResync, bool) {
-//	bgs.pdsResyncsLk.Lock()
-//	defer bgs.pdsResyncsLk.Unlock()
-//
-//	if r, ok := bgs.pdsResyncs[pds.ID]; ok && r != nil {
-//		return *r, true
-//	}
-//
-//	r := PDSResync{
-//		PDS:             pds,
-//		Status:          "started",
-//		StatusChangedAt: time.Now(),
-//	}
-//
-//	bgs.pdsResyncs[pds.ID] = &r
-//
-//	return r, false
-//}
-//
-//func (bgs *BGS) GetResync(pds models.PDS) (PDSResync, bool) {
-//	bgs.pdsResyncsLk.RLock()
-//	defer bgs.pdsResyncsLk.RUnlock()
-//
-//	if r, ok := bgs.pdsResyncs[pds.ID]; ok {
-//		return *r, true
-//	}
-//
-//	return PDSResync{}, false
-//}
-//
-//func (bgs *BGS) UpdateResync(resync PDSResync) {
-//	bgs.pdsResyncsLk.Lock()
-//	defer bgs.pdsResyncsLk.Unlock()
-//
-//	bgs.pdsResyncs[resync.PDS.ID] = &resync
-//}
-//
-//func (bgs *BGS) SetResyncStatus(id uint, status string) PDSResync {
-//	bgs.pdsResyncsLk.Lock()
-//	defer bgs.pdsResyncsLk.Unlock()
-//
-//	if r, ok := bgs.pdsResyncs[id]; ok {
-//		r.Status = status
-//		r.StatusChangedAt = time.Now()
-//	}
-//
-//	return *bgs.pdsResyncs[id]
-//}
-//
-//func (bgs *BGS) CompleteResync(resync PDSResync) {
-//	bgs.pdsResyncsLk.Lock()
-//	defer bgs.pdsResyncsLk.Unlock()
-//
-//	delete(bgs.pdsResyncs, resync.PDS.ID)
-//}
