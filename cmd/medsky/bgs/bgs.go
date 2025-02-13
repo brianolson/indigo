@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/bluesky-social/indigo/carstore"
 	"github.com/ipfs/go-cid"
 	"log/slog"
 	"net"
@@ -22,9 +21,9 @@ import (
 	"github.com/bluesky-social/indigo/api"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/cmd/medsky/events"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
-	"github.com/bluesky-social/indigo/events"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/xrpc"
@@ -151,6 +150,7 @@ func NewBGS(db *gorm.DB, repoman *repomgr.RepoManager, evtman *events.EventManag
 	slOpts.DefaultRepoLimit = config.DefaultRepoLimit
 	slOpts.ConcurrencyPerPDS = config.ConcurrencyPerPDS
 	slOpts.MaxQueuePerPDS = config.MaxQueuePerPDS
+	slOpts.Logger = bgs.log
 	s, err := NewSlurper(db, bgs.handleFedEvent, slOpts)
 	if err != nil {
 		return nil, err
@@ -411,8 +411,8 @@ type User struct {
 	UpstreamStatus string `gorm:"index"`
 
 	// Last known root and rev for repo; TODO: add bits needed for induction firehose?
-	Root models.DbCID `gorm:"root"`
-	Rev  string       `gorm:"rev"`
+	Root *models.DbCID `gorm:"root"`
+	Rev  string        `gorm:"rev"`
 
 	lk sync.Mutex
 }
@@ -706,6 +706,19 @@ func (s *BGS) findDomainBan(ctx context.Context, host string) (bool, error) {
 	return true, nil
 }
 
+var ErrNotFound = errors.New("not found")
+
+func (bgs *BGS) DidToUid(ctx context.Context, did string) (models.Uid, error) {
+	xu, err := bgs.lookupUserByDid(ctx, did)
+	if err != nil {
+		return 0, err
+	}
+	if xu == nil {
+		return 0, ErrNotFound
+	}
+	return xu.ID, nil
+}
+
 func (bgs *BGS) lookupUserByDid(ctx context.Context, did string) (*User, error) {
 	ctx, span := tracer.Start(ctx, "lookupUserByDid")
 	defer span.End()
@@ -771,9 +784,9 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 		evt := env.RepoCommit
 		bgs.log.Debug("bgs got repo append event", "seq", evt.Seq, "pdsHost", host.Host, "repo", evt.Repo)
 
-		s := time.Now()
+		//s := time.Now()
 		u, err := bgs.lookupUserByDid(ctx, evt.Repo)
-		userLookupDuration.Observe(time.Since(s).Seconds())
+		//userLookupDuration.Observe(time.Since(s).Seconds())
 		if err != nil {
 			if !errors.Is(err, gorm.ErrRecordNotFound) {
 				repoCommitsResultCounter.WithLabelValues(host.Host, "nou").Inc()
@@ -860,7 +873,7 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 
 		if err := bgs.repoman.HandleCommit(ctx, host, u, evt); err != nil {
 
-			if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
+			if ipld.IsNotFound(err) {
 				//ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
 				//if lerr != nil {
 				//	log.Warn("failed handling event, no user", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
@@ -876,7 +889,7 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 				//return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
 			}
 
-			log.Warn("failed handling event", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+			bgs.log.Warn("failed handling event", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
 			repoCommitsResultCounter.WithLabelValues(host.Host, "err").Inc()
 			return fmt.Errorf("handle user event failed: %w", err)
 		}

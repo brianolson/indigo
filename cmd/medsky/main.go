@@ -16,9 +16,9 @@ import (
 
 	"github.com/bluesky-social/indigo/api"
 	libbgs "github.com/bluesky-social/indigo/cmd/medsky/bgs"
+	"github.com/bluesky-social/indigo/cmd/medsky/events"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
 	"github.com/bluesky-social/indigo/did"
-	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/plc"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
@@ -75,12 +75,6 @@ func run(args []string) error {
 			Name: "db-tracing",
 		},
 		&cli.StringFlag{
-			Name:    "data-dir",
-			Usage:   "path of directory for CAR files and other data",
-			Value:   "data/bigsky",
-			EnvVars: []string{"RELAY_DATA_DIR", "DATA_DIR"},
-		},
-		&cli.StringFlag{
 			Name:    "plc-host",
 			Usage:   "method, hostname, and port of PLC registry",
 			Value:   "https://plc.directory",
@@ -100,10 +94,9 @@ func run(args []string) error {
 			EnvVars: []string{"RELAY_METRICS_LISTEN", "BGS_METRICS_LISTEN"},
 		},
 		&cli.StringFlag{
-			Name:     "disk-persister-dir",
-			Usage:    "set directory for disk persister (implicitly enables disk persister)",
-			Required: true,
-			EnvVars:  []string{"RELAY_PERSISTER_DIR"},
+			Name:    "disk-persister-dir",
+			Usage:   "set directory for disk persister (implicitly enables disk persister)",
+			EnvVars: []string{"RELAY_PERSISTER_DIR"},
 		},
 		&cli.StringFlag{
 			Name:    "admin-key",
@@ -272,12 +265,6 @@ func runBigsky(cctx *cli.Context) error {
 		return err
 	}
 
-	// ensure data directory exists; won't error if it does
-	datadir := cctx.String("data-dir")
-	if err := os.MkdirAll(datadir, os.ModePerm); err != nil {
-		return err
-	}
-
 	dburl := cctx.String("db-url")
 	slog.Info("setting up main database", "url", dburl)
 	db, err := cliutil.SetupDatabase(dburl, cctx.Int("max-metadb-connections"))
@@ -414,6 +401,7 @@ func runBigsky(cctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	dp.SetUidSource(bgs)
 
 	if tok := cctx.String("admin-key"); tok != "" {
 		if err := bgs.CreateAdminToken(tok); err != nil {

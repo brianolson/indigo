@@ -52,17 +52,6 @@ var connectedInbound = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of inbound firehoses we are consuming",
 })
 
-var compactionDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "compaction_duration",
-	Help:    "A histogram of compaction latencies",
-	Buckets: prometheus.ExponentialBuckets(0.001, 3, 14),
-})
-
-var compactionQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "compaction_queue_depth",
-	Help: "The current depth of the compaction queue",
-})
-
 var newUsersDiscovered = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "bgs_new_users_discovered",
 	Help: "The total number of new users discovered directly from the firehose (not from refs)",
@@ -91,11 +80,11 @@ var resSz = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBuckets(100, 10, 8),
 }, []string{"code", "method", "path"})
 
-var userLookupDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "relay_user_lookup_duration",
-	Help:    "A histogram of user lookup latencies",
-	Buckets: prometheus.ExponentialBuckets(0.001, 2, 15),
-})
+//var userLookupDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+//	Name:    "relay_user_lookup_duration",
+//	Help:    "A histogram of user lookup latencies",
+//	Buckets: prometheus.ExponentialBuckets(0.001, 2, 15),
+//})
 
 var newUserDiscoveryDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "relay_new_user_discovery_duration",

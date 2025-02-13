@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/events"
+	"github.com/bluesky-social/indigo/cmd/medsky/events"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/repo"
 	blockformat "github.com/ipfs/go-block-format"
