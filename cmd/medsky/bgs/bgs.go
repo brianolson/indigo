@@ -11,15 +11,12 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/bluesky-social/indigo/api"
-	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/cmd/medsky/events"
 	"github.com/bluesky-social/indigo/cmd/medsky/repomgr"
@@ -27,6 +24,7 @@ import (
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/xrpc"
+
 	"github.com/gorilla/websocket"
 	lru "github.com/hashicorp/golang-lru/v2"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -639,26 +637,6 @@ func (bgs *BGS) EventsHandler(c echo.Context) error {
 	}
 }
 
-func prometheusHandler() http.Handler {
-	// Prometheus globals are exposed as interfaces, but the prometheus
-	// OpenCensus exporter expects a concrete *Registry. The concrete type of
-	// the globals are actually *Registry, so we downcast them, staying
-	// defensive in case things change under the hood.
-	registry, ok := promclient.DefaultRegisterer.(*promclient.Registry)
-	if !ok {
-		slog.Warn("failed to export default prometheus registry; some metrics will be unavailable; unexpected type", "type", reflect.TypeOf(promclient.DefaultRegisterer))
-	}
-	exporter, err := prometheus.NewExporter(prometheus.Options{
-		Registry:  registry,
-		Namespace: "bigsky",
-	})
-	if err != nil {
-		slog.Error("could not create the prometheus stats exporter", "err", err, "system", "bgs")
-	}
-
-	return exporter
-}
-
 // domainIsBanned checks if the given host is banned, starting with the host
 // itself, then checking every parent domain up to the tld
 func (s *BGS) domainIsBanned(ctx context.Context, host string) (bool, error) {
@@ -1045,7 +1023,7 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 	}
 }
 
-func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *atproto.SyncSubscribeRepos_Tombstone) error {
+func (bgs *BGS) handleRepoTombstone(ctx context.Context, pds *models.PDS, evt *comatproto.SyncSubscribeRepos_Tombstone) error {
 	u, err := bgs.lookupUserByDid(ctx, evt.Did)
 	if err != nil {
 		return err
@@ -1115,7 +1093,7 @@ func (bgs *BGS) createExternalUser(ctx context.Context, did string) (*User, erro
 		pclient := &xrpc.Client{Host: durl.String()}
 		bgs.config.ApplyPDSClientSettings(pclient)
 		// TODO: the case of handling a new user on a new PDS probably requires more thought
-		cfg, err := atproto.ServerDescribeServer(ctx, pclient)
+		cfg, err := comatproto.ServerDescribeServer(ctx, pclient)
 		if err != nil {
 			// TODO: failing this shouldn't halt our indexing
 			return nil, fmt.Errorf("failed to check unrecognized pds: %w", err)
