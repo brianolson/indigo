@@ -336,35 +336,17 @@ func runBigsky(cctx *cli.Context) error {
 
 	evtman := events.NewEventManager(persister)
 
-	rlskip := cctx.String("bsky-social-rate-limit-skip")
-	// TODO: pass this into bgs somehow -- bolson 2025
-	applyPDSClientSettings := func(c *xrpc.Client) {
-		if c.Client == nil {
-			c.Client = util.RobustHTTPClient()
-		}
-		if strings.HasSuffix(c.Host, ".bsky.network") {
-			c.Client.Timeout = time.Minute * 30
-			if rlskip != "" {
-				c.Headers = map[string]string{
-					"x-ratelimit-bypass": rlskip,
-				}
-			}
-		} else {
-			// Generic PDS timeout
-			c.Client.Timeout = time.Minute * 1
-		}
-	}
-
 	repoman.SetEventManager(evtman)
 
 	prodHR, err := api.NewProdHandleResolver(100_000, cctx.String("resolve-address"), cctx.Bool("force-dns-udp"))
 	if err != nil {
 		return fmt.Errorf("failed to set up handle resolver: %w", err)
 	}
-	if rlskip != "" {
+	ratelimitBypass := cctx.String("bsky-social-rate-limit-skip")
+	if ratelimitBypass != "" {
 		prodHR.ReqMod = func(req *http.Request, host string) error {
 			if strings.HasSuffix(host, ".bsky.social") {
-				req.Header.Set("x-ratelimit-bypass", rlskip)
+				req.Header.Set("x-ratelimit-bypass", ratelimitBypass)
 			}
 			return nil
 		}
@@ -383,7 +365,7 @@ func runBigsky(cctx *cli.Context) error {
 	bgsConfig.ConcurrencyPerPDS = cctx.Int64("concurrency-per-pds")
 	bgsConfig.MaxQueuePerPDS = cctx.Int64("max-queue-per-pds")
 	bgsConfig.DefaultRepoLimit = cctx.Int64("default-repo-limit")
-	bgsConfig.ApplyPDSClientSettings = applyPDSClientSettings
+	bgsConfig.ApplyPDSClientSettings = makePdsClientSetup(ratelimitBypass)
 	nextCrawlers := cctx.StringSlice("next-crawler")
 	if len(nextCrawlers) != 0 {
 		nextCrawlerUrls := make([]*url.URL, len(nextCrawlers))
@@ -446,4 +428,23 @@ func runBigsky(cctx *cli.Context) error {
 	log.Info("shutdown complete")
 
 	return nil
+}
+
+func makePdsClientSetup(ratelimitBypass string) func(c *xrpc.Client) {
+	return func(c *xrpc.Client) {
+		if c.Client == nil {
+			c.Client = util.RobustHTTPClient()
+		}
+		if strings.HasSuffix(c.Host, ".bsky.network") {
+			c.Client.Timeout = time.Minute * 30
+			if ratelimitBypass != "" {
+				c.Headers = map[string]string{
+					"x-ratelimit-bypass": ratelimitBypass,
+				}
+			}
+		} else {
+			// Generic PDS timeout
+			c.Client.Timeout = time.Minute * 1
+		}
+	}
 }

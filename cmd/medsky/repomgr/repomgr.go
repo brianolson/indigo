@@ -127,31 +127,6 @@ func (rm *RepoManager) lockUser(ctx context.Context, user models.Uid) func() {
 	}
 }
 
-func (rm *RepoManager) CheckRepoSig(ctx context.Context, r *repo.Repo, expdid string) error {
-	ctx, span := otel.Tracer("repoman").Start(ctx, "CheckRepoSig")
-	defer span.End()
-
-	repoDid := r.RepoDid()
-	if expdid != repoDid {
-		return fmt.Errorf("DID in repo did not match (%q != %q)", expdid, repoDid)
-	}
-
-	scom := r.SignedCommit()
-
-	usc := scom.Unsigned()
-	sb, err := usc.BytesForSigning()
-	if err != nil {
-		return fmt.Errorf("commit serialization failed: %w", err)
-	}
-	if err := rm.kmgr.VerifyUserSignature(ctx, repoDid, scom.Sig, sb); err != nil {
-		return fmt.Errorf("signature check failed (sig: %x) (sb: %x) : %w", scom.Sig, sb, err)
-	}
-
-	return nil
-}
-
-var ErrRepoBaseMismatch = fmt.Errorf("attempted a delta session on top of the wrong previous head")
-
 var ErrNoRootBlock = errors.New("no root block")
 
 type mapIpldBlockstore struct {
