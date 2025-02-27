@@ -8,6 +8,8 @@ import (
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	chat "github.com/bluesky-social/indigo/api/chat"
 	"github.com/bluesky-social/indigo/atproto/data"
+	atrepo "github.com/bluesky-social/indigo/atproto/repo"
+	atmst "github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/events"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/mst"
@@ -62,6 +64,7 @@ func main() {
 		bsky.FeedThreadgate{},
 		bsky.FeedThreadgate_ListRule{},
 		bsky.FeedThreadgate_MentionRule{},
+		bsky.FeedThreadgate_FollowerRule{},
 		bsky.FeedThreadgate_FollowingRule{},
 		bsky.GraphStarterpack_FeedItem{},
 		bsky.GraphStarterpack{},
@@ -88,6 +91,7 @@ func main() {
 	}
 
 	if err := genCfg.WriteMapEncodersToFile("api/atproto/cbor_gen.go", "atproto",
+		atproto.LexiconSchema{},
 		atproto.RepoStrongRef{},
 		atproto.SyncSubscribeRepos_Commit{},
 		atproto.SyncSubscribeRepos_Handle{},
@@ -117,6 +121,14 @@ func main() {
 	}
 
 	if err := genCfg.WriteMapEncodersToFile("atproto/data/cbor_gen.go", "data", data.GenericRecord{}, data.LegacyBlobSchema{}, data.BlobSchema{}); err != nil {
+		panic(err)
+	}
+
+	if err := genCfg.WriteMapEncodersToFile("atproto/repo/cbor_gen.go", "repo", atrepo.Commit{}); err != nil {
+		panic(err)
+	}
+
+	if err := genCfg.WriteMapEncodersToFile("atproto/repo/mst/cbor_gen.go", "mst", atmst.NodeData{}, atmst.EntryData{}); err != nil {
 		panic(err)
 	}
 }

@@ -19,6 +19,151 @@ var _ = cid.Undef
 var _ = math.E
 var _ = sort.Sort
 
+func (t *LexiconSchema) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{162}); err != nil {
+		return err
+	}
+
+	// t.LexiconTypeID (string) (string)
+	if len("$type") > 1000000 {
+		return xerrors.Errorf("Value in field \"$type\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("$type"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("$type")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("com.atproto.lexicon.schema"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("com.atproto.lexicon.schema")); err != nil {
+		return err
+	}
+
+	// t.Lexicon (int64) (int64)
+	if len("lexicon") > 1000000 {
+		return xerrors.Errorf("Value in field \"lexicon\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("lexicon"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("lexicon")); err != nil {
+		return err
+	}
+
+	if t.Lexicon >= 0 {
+		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Lexicon)); err != nil {
+			return err
+		}
+	} else {
+		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Lexicon-1)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (t *LexiconSchema) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = LexiconSchema{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("LexiconSchema: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 7)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.LexiconTypeID (string) (string)
+		case "$type":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.LexiconTypeID = string(sval)
+			}
+			// t.Lexicon (int64) (int64)
+		case "lexicon":
+			{
+				maj, extra, err := cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				var extraI int64
+				switch maj {
+				case cbg.MajUnsignedInt:
+					extraI = int64(extra)
+					if extraI < 0 {
+						return fmt.Errorf("int64 positive overflow")
+					}
+				case cbg.MajNegativeInt:
+					extraI = int64(extra)
+					if extraI < 0 {
+						return fmt.Errorf("int64 negative overflow")
+					}
+					extraI = -1 - extraI
+				default:
+					return fmt.Errorf("wrong type for int64 field: %d", maj)
+				}
+
+				t.Lexicon = int64(extraI)
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
 func (t *RepoStrongRef) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
@@ -204,6 +349,10 @@ func (t *SyncSubscribeRepos_Commit) MarshalCBOR(w io.Writer) error {
 		fieldCount--
 	}
 
+	if t.PrevData == nil {
+		fieldCount--
+	}
+
 	if _, err := cw.Write(cbg.CborEncodeMajorType(cbg.MajMap, uint64(fieldCount))); err != nil {
 		return err
 	}
@@ -277,22 +426,6 @@ func (t *SyncSubscribeRepos_Commit) MarshalCBOR(w io.Writer) error {
 		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Seq-1)); err != nil {
 			return err
 		}
-	}
-
-	// t.Prev (util.LexLink) (struct)
-	if len("prev") > 1000000 {
-		return xerrors.Errorf("Value in field \"prev\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("prev"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("prev")); err != nil {
-		return err
-	}
-
-	if err := t.Prev.MarshalCBOR(cw); err != nil {
-		return err
 	}
 
 	// t.Repo (string) (string)
@@ -471,6 +604,25 @@ func (t *SyncSubscribeRepos_Commit) MarshalCBOR(w io.Writer) error {
 	if err := cbg.WriteBool(w, t.TooBig); err != nil {
 		return err
 	}
+
+	// t.PrevData (util.LexLink) (struct)
+	if t.PrevData != nil {
+
+		if len("prevData") > 1000000 {
+			return xerrors.Errorf("Value in field \"prevData\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("prevData"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("prevData")); err != nil {
+			return err
+		}
+
+		if err := t.PrevData.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -499,7 +651,7 @@ func (t *SyncSubscribeRepos_Commit) UnmarshalCBOR(r io.Reader) (err error) {
 
 	n := extra
 
-	nameBuf := make([]byte, 6)
+	nameBuf := make([]byte, 8)
 	for i := uint64(0); i < n; i++ {
 		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
 		if err != nil {
@@ -600,26 +752,6 @@ func (t *SyncSubscribeRepos_Commit) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.Seq = int64(extraI)
-			}
-			// t.Prev (util.LexLink) (struct)
-		case "prev":
-
-			{
-
-				b, err := cr.ReadByte()
-				if err != nil {
-					return err
-				}
-				if b != cbg.CborNull[0] {
-					if err := cr.UnreadByte(); err != nil {
-						return err
-					}
-					t.Prev = new(util.LexLink)
-					if err := t.Prev.UnmarshalCBOR(cr); err != nil {
-						return xerrors.Errorf("unmarshaling t.Prev pointer: %w", err)
-					}
-				}
-
 			}
 			// t.Repo (string) (string)
 		case "repo":
@@ -771,6 +903,26 @@ func (t *SyncSubscribeRepos_Commit) UnmarshalCBOR(r io.Reader) (err error) {
 				t.TooBig = true
 			default:
 				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
+			}
+			// t.PrevData (util.LexLink) (struct)
+		case "prevData":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.PrevData = new(util.LexLink)
+					if err := t.PrevData.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.PrevData pointer: %w", err)
+					}
+				}
+
 			}
 
 		default:
@@ -1910,8 +2062,13 @@ func (t *SyncSubscribeRepos_RepoOp) MarshalCBOR(w io.Writer) error {
 	}
 
 	cw := cbg.NewCborWriter(w)
+	fieldCount := 4
 
-	if _, err := cw.Write([]byte{163}); err != nil {
+	if t.Prev == nil {
+		fieldCount--
+	}
+
+	if _, err := cw.Write(cbg.CborEncodeMajorType(cbg.MajMap, uint64(fieldCount))); err != nil {
 		return err
 	}
 
@@ -1952,6 +2109,25 @@ func (t *SyncSubscribeRepos_RepoOp) MarshalCBOR(w io.Writer) error {
 	}
 	if _, err := cw.WriteString(string(t.Path)); err != nil {
 		return err
+	}
+
+	// t.Prev (util.LexLink) (struct)
+	if t.Prev != nil {
+
+		if len("prev") > 1000000 {
+			return xerrors.Errorf("Value in field \"prev\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("prev"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("prev")); err != nil {
+			return err
+		}
+
+		if err := t.Prev.MarshalCBOR(cw); err != nil {
+			return err
+		}
 	}
 
 	// t.Action (string) (string)
@@ -2050,6 +2226,26 @@ func (t *SyncSubscribeRepos_RepoOp) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.Path = string(sval)
+			}
+			// t.Prev (util.LexLink) (struct)
+		case "prev":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.Prev = new(util.LexLink)
+					if err := t.Prev.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.Prev pointer: %w", err)
+					}
+				}
+
 			}
 			// t.Action (string) (string)
 		case "action":

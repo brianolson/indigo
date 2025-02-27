@@ -5,12 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/sequential"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
-	"github.com/gorilla/websocket"
-	"github.com/urfave/cli/v2"
 	"io"
 	"math"
 	"net/http"
@@ -19,6 +13,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	comatproto "github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/events"
+	"github.com/bluesky-social/indigo/events/schedulers/sequential"
+	lexutil "github.com/bluesky-social/indigo/lex/util"
+	"github.com/gorilla/websocket"
+	"github.com/urfave/cli/v2"
 )
 
 type compareStreamsSession struct {
@@ -195,10 +196,9 @@ func (dwa *durationWindowedAverage) stats() durationWindowedAverageStats {
 
 // just the bits we need from comatproto.SyncSubscribeRepos_Commit
 type minCommit struct {
-	Commit lexutil.LexLink  `json:"commit,omitempty" cborgen:"commit"`
-	Prev   *lexutil.LexLink `json:"prev,omitempty" cborgen:"prev"`
-	Repo   string           `json:"repo,omitempty" cborgen:"repo"`
-	Seq    int64            `json:"seq,omitempty" cborgen:"seq"`
+	Commit lexutil.LexLink `json:"commit,omitempty" cborgen:"commit"`
+	Repo   string          `json:"repo,omitempty" cborgen:"repo"`
+	Seq    int64           `json:"seq,omitempty" cborgen:"seq"`
 }
 
 type ExpireRecord struct {
@@ -211,7 +211,6 @@ type ExpireRecord struct {
 func commitToMinCommit(evt *comatproto.SyncSubscribeRepos_Commit) minCommit {
 	return minCommit{
 		Commit: evt.Commit,
-		Prev:   evt.Prev,
 		Repo:   evt.Repo,
 		Seq:    evt.Seq,
 	}
@@ -250,13 +249,6 @@ func (cstream *compareStreamsStream) findMatchAndRemove(event indexedEvent) (fou
 	}
 
 	for i, ev := range slice {
-		if ev.event.Commit == event.event.Commit {
-			if !llpEq(ev.event.Prev, event.event.Prev) {
-				// same commit different prev??
-				return false, 0, fmt.Errorf("matched event with same commit but different prev: (%d) (seq=%d prev %#v) (seq=%d prev %#v)", cstream.n, ev.event.Seq, ev.event.Prev, event.event.Seq, event.event.Prev)
-			}
-		}
-
 		if i != 0 {
 			fmt.Printf("detected skipped event: %d (%d)\n", slice[0].event.Seq, i)
 		}

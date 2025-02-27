@@ -220,6 +220,8 @@ var debugStreamCmd = &cli.Command{
 						fmt.Printf("\nEvent at sequence %d had an invalid repo slice: %s\n", evt.Seq, err)
 						return nil
 					} else {
+						_ = r
+						/* "prev" is no longer included in #commit messages
 						prev, err := r.PrevCommit(ctx)
 						if err != nil {
 							return err
@@ -237,6 +239,7 @@ var debugStreamCmd = &cli.Command{
 						if !evt.Rebase && cs != es {
 							fmt.Printf("\nEvent at sequence %d has mismatch between slice prev and struct prev: %s != %s\n", evt.Seq, prev, evt.Prev)
 						}
+						*/
 					}
 				}
 
@@ -733,7 +736,7 @@ var debugCompareReposCmd = &cli.Command{
 
 			rep1, err = repo.ReadRepoFromCar(ctx, bytes.NewReader(repo1bytes))
 			if err != nil {
-				logger.Error("reading repo", "err", err)
+				logger.Error("reading repo", "err", err, "bytes", len(repo1bytes))
 				os.Exit(1)
 				return
 			}
@@ -752,7 +755,7 @@ var debugCompareReposCmd = &cli.Command{
 
 			rep2, err = repo.ReadRepoFromCar(ctx, bytes.NewReader(repo2bytes))
 			if err != nil {
-				logger.Error("reading repo", "err", err)
+				logger.Error("reading repo", "err", err, "bytes", len(repo2bytes))
 				os.Exit(1)
 				return
 			}

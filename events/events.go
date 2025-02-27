@@ -152,7 +152,7 @@ const (
 
 type EventHeader struct {
 	Op      int64  `cborgen:"op"`
-	MsgType string `cborgen:"t"`
+	MsgType string `cborgen:"t,omitempty"`
 }
 
 var (
@@ -452,6 +452,31 @@ func (evt *XRPCStreamEvent) Sequence() int64 {
 		return -1
 	default:
 		return -1
+	}
+}
+
+func (evt *XRPCStreamEvent) GetSequence() (int64, bool) {
+	switch {
+	case evt == nil:
+		return -1, false
+	case evt.RepoCommit != nil:
+		return evt.RepoCommit.Seq, true
+	case evt.RepoHandle != nil:
+		return evt.RepoHandle.Seq, true
+	case evt.RepoMigrate != nil:
+		return evt.RepoMigrate.Seq, true
+	case evt.RepoTombstone != nil:
+		return evt.RepoTombstone.Seq, true
+	case evt.RepoIdentity != nil:
+		return evt.RepoIdentity.Seq, true
+	case evt.RepoAccount != nil:
+		return evt.RepoAccount.Seq, true
+	case evt.RepoInfo != nil:
+		return -1, false
+	case evt.Error != nil:
+		return -1, false
+	default:
+		return -1, false
 	}
 }
 
