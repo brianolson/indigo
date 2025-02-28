@@ -301,10 +301,14 @@ func (cstream *compareStreamsStream) add(event indexedEvent) {
 }
 
 func (cstream *compareStreamsStream) run(d *websocket.Dialer) {
-	con, _, err := d.Dial(cstream.url, http.Header{})
+	con, response, err := d.Dial(cstream.url, http.Header{})
 	i := cstream.n
 	if err != nil {
-		log.Error("Dial failure", "i", i, "url", cstream.url, "err", err)
+		sc := -1
+		if response != nil {
+			sc = response.StatusCode
+		}
+		log.Error("Dial failure", "i", i, "url", cstream.url, "err", err, "sc", sc)
 		os.Exit(1)
 	}
 
