@@ -143,14 +143,17 @@ def makeByHost(they):
 
 def makeLimits(rec):
     "for submitting to changeLimits"
-    return {
+    ob = {
         "host": rec['Host'],
         "per_second":rec['RateLimit'],
         "per_hour":rec['HourlyEventLimit'],
         "per_day":rec['DailyEventLimit'],
-        "crawl_rate":rec['CrawlRateLimit'],
         "repo_limit":rec['RepoLimit'],
     }
+    if 'CrawlRateLimit' in rec:
+        # CrawlRateLimit/crawl_rate is deprecated and going away
+        ob['crawl_rate'] = rec['CrawlRateLimit']
+    return ob
 
 def makeRequestCrawl(rec):
     "for submitting to requestCrawl"
@@ -219,6 +222,10 @@ def copy_pdses(args):
             difblock.append((k1,v1["Blocked"]))
         if v1["Blocked"]:
             continue
+        if (lim1.get('crawl_rate') is None) or (lim2.get('crawl_rate') is None):
+            # if either side has it as None, it's a medsky new relay and we deprecate and do not act on crawl_rate
+            lim1.pop('crawl_rate', None)
+            lim2.pop('crawl_rate', None)
         if not de(lim1, lim2):
             diflim.append(lim1)
         if v1["HasActiveConnection"] and not v2["HasActiveConnection"]:
