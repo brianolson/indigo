@@ -17,7 +17,6 @@ help: ## Print info about all commands
 .PHONY: build
 build: ## Build all executables
 	go build ./cmd/gosky
-	go build ./cmd/laputa
 	go build ./cmd/bigsky
 	go build ./cmd/beemo
 	go build ./cmd/lexgen
@@ -89,6 +88,10 @@ run-dev-opensearch: .env ## Runs a local opensearch instance
 run-dev-relay: .env ## Runs 'bigsky' Relay for local dev
 	GOLOG_LOG_LEVEL=info go run ./cmd/bigsky --admin-key localdev
 # --crawl-insecure-ws
+
+.PHONY: run-dev-ident
+run-dev-ident: .env ## Runs 'bluepages' identity directory for local dev
+	GOLOG_LOG_LEVEL=info go run ./cmd/bluepages serve
 
 .PHONY: build-relay-image
 build-relay-image: ## Builds 'bigsky' Relay docker image

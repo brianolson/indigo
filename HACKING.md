@@ -7,7 +7,6 @@ Run with, eg, `go run ./cmd/bigsky`):
 - `cmd/palomar`: search indexer and query servcie (OpenSearch)
 - `cmd/gosky`: client CLI for talking to a PDS
 - `cmd/lexgen`: codegen tool for lexicons (Lexicon JSON to Go package)
-- `cmd/laputa`: partial PDS daemon (not usable or under development)
 - `cmd/stress`: connects to local/default PDS and creates a ton of random posts
 - `cmd/beemo`: slack bot for moderation reporting (Bluesky Moderation Observer)
 - `cmd/fakermaker`: helper to generate fake accounts and content for testing
@@ -15,6 +14,7 @@ Run with, eg, `go run ./cmd/bigsky`):
 - `cmd/sonar`: event stream monitoring tool
 - `cmd/hepa`: auto-moderation rule engine service
 - `cmd/rainbow`: firehose fanout service
+- `cmd/bluepages`: identity directory service
 - `gen`: dev tool to run CBOR type codegen
 
 Packages:

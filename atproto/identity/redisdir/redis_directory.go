@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -116,9 +117,7 @@ func (d *RedisDirectory) updateHandle(ctx context.Context, h syntax.Handle) hand
 			TTL:   d.ErrTTL,
 		})
 		if err != nil {
-			he.DID = nil
-			he.Err = fmt.Errorf("identity cache write failed: %w", err)
-			return he
+			slog.Error("identity cache write failed", "cache", "handle", "err", err)
 		}
 		return he
 	}
@@ -141,9 +140,7 @@ func (d *RedisDirectory) updateHandle(ctx context.Context, h syntax.Handle) hand
 		TTL:   d.HitTTL,
 	})
 	if err != nil {
-		he.DID = nil
-		he.Err = fmt.Errorf("identity cache write failed: %w", err)
-		return he
+		slog.Error("identity cache write failed", "cache", "did", "did", ident.DID, "err", err)
 	}
 	err = d.handleCache.Set(&cache.Item{
 		Ctx:   ctx,
@@ -152,24 +149,27 @@ func (d *RedisDirectory) updateHandle(ctx context.Context, h syntax.Handle) hand
 		TTL:   d.HitTTL,
 	})
 	if err != nil {
-		he.DID = nil
-		he.Err = fmt.Errorf("identity cache write failed: %w", err)
-		return he
+		slog.Error("identity cache write failed", "cache", "handle", "did", ident.DID, "err", err)
 	}
 	return he
 }
 
 func (d *RedisDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (syntax.DID, error) {
+	start := time.Now()
 	if h.IsInvalidHandle() {
 		return "", fmt.Errorf("can not resolve handle: %w", identity.ErrInvalidHandle)
 	}
 	var entry handleEntry
 	err := d.handleCache.Get(ctx, redisDirPrefix+h.String(), &entry)
 	if err != nil && err != cache.ErrCacheMiss {
+		handleResolution.WithLabelValues("redisdir", "error").Inc()
+		handleResolutionDuration.WithLabelValues("redisdir", "error").Observe(time.Since(start).Seconds())
 		return "", fmt.Errorf("identity cache read failed: %w", err)
 	}
 	if err == nil && !d.isHandleStale(&entry) { // if no error...
 		handleCacheHits.Inc()
+		handleResolution.WithLabelValues("redisdir", "cached").Inc()
+		handleResolutionDuration.WithLabelValues("redisdir", "cached").Observe(time.Since(start).Seconds())
 		if entry.Err != nil {
 			return "", entry.Err
 		} else if entry.DID != nil {
@@ -185,6 +185,8 @@ func (d *RedisDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 	val, loaded := d.handleLookupChans.LoadOrStore(h.String(), res)
 	if loaded {
 		handleRequestsCoalesced.Inc()
+		handleResolution.WithLabelValues("redisdir", "coalesced").Inc()
+		handleResolutionDuration.WithLabelValues("redisdir", "coalesced").Observe(time.Since(start).Seconds())
 		// Wait for the result from the pending request
 		select {
 		case <-val.(chan struct{}):
@@ -217,9 +219,13 @@ func (d *RedisDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 	close(res)
 
 	if newEntry.Err != nil {
+		handleResolution.WithLabelValues("redisdir", "error").Inc()
+		handleResolutionDuration.WithLabelValues("redisdir", "error").Observe(time.Since(start).Seconds())
 		return "", newEntry.Err
 	}
 	if newEntry.DID != nil {
+		handleResolution.WithLabelValues("redisdir", "success").Inc()
+		handleResolutionDuration.WithLabelValues("redisdir", "success").Observe(time.Since(start).Seconds())
 		return *newEntry.DID, nil
 	}
 	return "", errors.New("unexpected control-flow error")
@@ -250,9 +256,7 @@ func (d *RedisDirectory) updateDID(ctx context.Context, did syntax.DID) identity
 		TTL:   d.HitTTL,
 	})
 	if err != nil {
-		entry.Identity = nil
-		entry.Err = fmt.Errorf("identity cache write failed: %w", err)
-		return entry
+		slog.Error("identity cache write failed", "cache", "did", "did", did, "err", err)
 	}
 	if he != nil {
 		err = d.handleCache.Set(&cache.Item{
@@ -262,9 +266,7 @@ func (d *RedisDirectory) updateDID(ctx context.Context, did syntax.DID) identity
 			TTL:   d.HitTTL,
 		})
 		if err != nil {
-			entry.Identity = nil
-			entry.Err = fmt.Errorf("identity cache write failed: %w", err)
-			return entry
+			slog.Error("identity cache write failed", "cache", "handle", "did", did, "err", err)
 		}
 	}
 	return entry
@@ -276,13 +278,18 @@ func (d *RedisDirectory) LookupDID(ctx context.Context, did syntax.DID) (*identi
 }
 
 func (d *RedisDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax.DID) (*identity.Identity, bool, error) {
+	start := time.Now()
 	var entry identityEntry
 	err := d.identityCache.Get(ctx, redisDirPrefix+did.String(), &entry)
 	if err != nil && err != cache.ErrCacheMiss {
+		didResolution.WithLabelValues("redisdir", "error").Inc()
+		didResolutionDuration.WithLabelValues("redisdir", "error").Observe(time.Since(start).Seconds())
 		return nil, false, fmt.Errorf("identity cache read failed: %w", err)
 	}
 	if err == nil && !d.isIdentityStale(&entry) { // if no error...
 		identityCacheHits.Inc()
+		didResolution.WithLabelValues("redisdir", "cached").Inc()
+		didResolutionDuration.WithLabelValues("redisdir", "cached").Observe(time.Since(start).Seconds())
 		return entry.Identity, true, entry.Err
 	}
 	identityCacheMisses.Inc()
@@ -292,6 +299,8 @@ func (d *RedisDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax
 	val, loaded := d.didLookupChans.LoadOrStore(did.String(), res)
 	if loaded {
 		identityRequestsCoalesced.Inc()
+		didResolution.WithLabelValues("redisdir", "coalesced").Inc()
+		didResolutionDuration.WithLabelValues("redisdir", "coalesced").Observe(time.Since(start).Seconds())
 		// Wait for the result from the pending request
 		select {
 		case <-val.(chan struct{}):
@@ -318,9 +327,13 @@ func (d *RedisDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax
 	close(res)
 
 	if newEntry.Err != nil {
+		didResolution.WithLabelValues("redisdir", "error").Inc()
+		didResolutionDuration.WithLabelValues("redisdir", "error").Observe(time.Since(start).Seconds())
 		return nil, false, newEntry.Err
 	}
 	if newEntry.Identity != nil {
+		didResolution.WithLabelValues("redisdir", "success").Inc()
+		didResolutionDuration.WithLabelValues("redisdir", "success").Observe(time.Since(start).Seconds())
 		return newEntry.Identity, false, nil
 	}
 	return nil, false, errors.New("unexpected control-flow error")

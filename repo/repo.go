@@ -43,7 +43,7 @@ type UnsignedCommit struct {
 type Repo struct {
 	sc  SignedCommit
 	cst cbor.IpldStore
-	bs  blockstore.Blockstore
+	bs  cbor.IpldBlockstore
 
 	repoCid cid.Cid
 
@@ -74,13 +74,13 @@ func (uc *UnsignedCommit) BytesForSigning() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func IngestRepo(ctx context.Context, bs blockstore.Blockstore, r io.Reader) (cid.Cid, error) {
+func IngestRepo(ctx context.Context, bs cbor.IpldBlockstore, r io.Reader) (cid.Cid, error) {
 	ctx, span := otel.Tracer("repo").Start(ctx, "Ingest")
 	defer span.End()
 
 	br, err := car.NewBlockReader(r)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, fmt.Errorf("opening CAR block reader: %w", err)
 	}
 
 	for {
@@ -89,11 +89,11 @@ func IngestRepo(ctx context.Context, bs blockstore.Blockstore, r io.Reader) (cid
 			if err == io.EOF {
 				break
 			}
-			return cid.Undef, err
+			return cid.Undef, fmt.Errorf("reading block from CAR: %w", err)
 		}
 
 		if err := bs.Put(ctx, blk); err != nil {
-			return cid.Undef, err
+			return cid.Undef, fmt.Errorf("copying block to store: %w", err)
 		}
 	}
 
@@ -104,13 +104,13 @@ func ReadRepoFromCar(ctx context.Context, r io.Reader) (*Repo, error) {
 	bs := blockstore.NewBlockstore(datastore.NewMapDatastore())
 	root, err := IngestRepo(ctx, bs, r)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ReadRepoFromCar:IngestRepo: %w", err)
 	}
 
 	return OpenRepo(ctx, bs, root)
 }
 
-func NewRepo(ctx context.Context, did string, bs blockstore.Blockstore) *Repo {
+func NewRepo(ctx context.Context, did string, bs cbor.IpldBlockstore) *Repo {
 	cst := util.CborStore(bs)
 
 	t := mst.NewEmptyMST(cst)
@@ -128,7 +128,7 @@ func NewRepo(ctx context.Context, did string, bs blockstore.Blockstore) *Repo {
 	}
 }
 
-func OpenRepo(ctx context.Context, bs blockstore.Blockstore, root cid.Cid) (*Repo, error) {
+func OpenRepo(ctx context.Context, bs cbor.IpldBlockstore, root cid.Cid) (*Repo, error) {
 	cst := util.CborStore(bs)
 
 	var sc SignedCommit
@@ -173,7 +173,7 @@ func (r *Repo) SignedCommit() SignedCommit {
 	return r.sc
 }
 
-func (r *Repo) Blockstore() blockstore.Blockstore {
+func (r *Repo) Blockstore() cbor.IpldBlockstore {
 	return r.bs
 }
 
@@ -435,11 +435,11 @@ func (r *Repo) DiffSince(ctx context.Context, oldrepo cid.Cid) ([]*mst.DiffOp, e
 	return mst.DiffTrees(ctx, r.bs, oldTree, curptr)
 }
 
-func (r *Repo) CopyDataTo(ctx context.Context, bs blockstore.Blockstore) error {
+func (r *Repo) CopyDataTo(ctx context.Context, bs cbor.IpldBlockstore) error {
 	return copyRecCbor(ctx, r.bs, bs, r.sc.Data, make(map[cid.Cid]struct{}))
 }
 
-func copyRecCbor(ctx context.Context, from, to blockstore.Blockstore, c cid.Cid, seen map[cid.Cid]struct{}) error {
+func copyRecCbor(ctx context.Context, from, to cbor.IpldBlockstore, c cid.Cid, seen map[cid.Cid]struct{}) error {
 	if _, ok := seen[c]; ok {
 		return nil
 	}

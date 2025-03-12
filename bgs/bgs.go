@@ -3,7 +3,6 @@ package bgs
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,13 +10,11 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/bluesky-social/indigo/api"
 	atproto "github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -25,7 +22,6 @@ import (
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/indexer"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/repomgr"
 	"github.com/bluesky-social/indigo/xrpc"
@@ -34,7 +30,6 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/gorilla/websocket"
-	"github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -207,95 +202,6 @@ func (bgs *BGS) StartMetrics(listen string) error {
 	return http.ListenAndServe(listen, nil)
 }
 
-// Disabled for now, maybe reimplement behind admin auth later
-func (bgs *BGS) StartDebug(listen string) error {
-	http.HandleFunc("/repodbg/user", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-
-		u, err := bgs.Index.LookupUserByDid(ctx, did)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		root, err := bgs.repoman.GetRepoRoot(ctx, u.Uid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		out := map[string]any{
-			"root":      root.String(),
-			"actorInfo": u,
-		}
-
-		if r.FormValue("carstore") != "" {
-			stat, err := bgs.repoman.CarStore().Stat(ctx, u.Uid)
-			if err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-			out["carstore"] = stat
-		}
-
-		json.NewEncoder(w).Encode(out)
-	})
-	http.HandleFunc("/repodbg/crawl", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-
-		act, err := bgs.Index.GetUserOrMissing(ctx, did)
-		if err != nil {
-			w.WriteHeader(500)
-			bgs.log.Error("failed to get user", "err", err)
-			return
-		}
-
-		if err := bgs.Index.Crawler.Crawl(ctx, act); err != nil {
-			w.WriteHeader(500)
-			bgs.log.Error("failed to add user to crawler", "err", err)
-			return
-		}
-	})
-	http.HandleFunc("/repodbg/blocks", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		did := r.FormValue("did")
-		c := r.FormValue("cid")
-
-		bcid, err := cid.Decode(c)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		cs := bgs.repoman.CarStore()
-
-		u, err := bgs.Index.LookupUserByDid(ctx, did)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		bs, err := cs.ReadOnlySession(u.Uid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		blk, err := bs.Get(ctx, bcid)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-
-		w.WriteHeader(200)
-		w.Write(blk.RawData())
-	})
-
-	return http.ListenAndServe(listen, nil)
-}
-
 func (bgs *BGS) Start(addr string) error {
 	var lc net.ListenConfig
 	ctx, cancel := context.WithTimeout(context.Background(), serverListenerBootTimeout)
@@ -395,6 +301,7 @@ func (bgs *BGS) StartWithListener(listen net.Listener) error {
 	// Repo-related Admin API
 	admin.POST("/repo/takeDown", bgs.handleAdminTakeDownRepo)
 	admin.POST("/repo/reverseTakedown", bgs.handleAdminReverseTakedown)
+	admin.GET("/repo/takedowns", bgs.handleAdminListRepoTakeDowns)
 	admin.POST("/repo/compact", bgs.handleAdminCompactRepo)
 	admin.POST("/repo/compactAll", bgs.handleAdminCompactAllRepos)
 	admin.POST("/repo/reset", bgs.handleAdminResetRepo)
@@ -760,26 +667,6 @@ func (bgs *BGS) EventsHandler(c echo.Context) error {
 	}
 }
 
-func prometheusHandler() http.Handler {
-	// Prometheus globals are exposed as interfaces, but the prometheus
-	// OpenCensus exporter expects a concrete *Registry. The concrete type of
-	// the globals are actually *Registry, so we downcast them, staying
-	// defensive in case things change under the hood.
-	registry, ok := promclient.DefaultRegisterer.(*promclient.Registry)
-	if !ok {
-		slog.Warn("failed to export default prometheus registry; some metrics will be unavailable; unexpected type", "type", reflect.TypeOf(promclient.DefaultRegisterer))
-	}
-	exporter, err := prometheus.NewExporter(prometheus.Options{
-		Registry:  registry,
-		Namespace: "bigsky",
-	})
-	if err != nil {
-		slog.Error("could not create the prometheus stats exporter", "err", err, "system", "bgs")
-	}
-
-	return exporter
-}
-
 // domainIsBanned checks if the given host is banned, starting with the host
 // itself, then checking every parent domain up to the tld
 func (s *BGS) domainIsBanned(ctx context.Context, host string) (bool, error) {
@@ -864,14 +751,6 @@ func (bgs *BGS) lookupUserByUID(ctx context.Context, uid models.Uid) (*User, err
 	}
 
 	return &u, nil
-}
-
-func stringLink(lnk *lexutil.LexLink) string {
-	if lnk == nil {
-		return "<nil>"
-	}
-
-	return lnk.String()
 }
 
 func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *events.XRPCStreamEvent) error {
@@ -1004,19 +883,19 @@ func (bgs *BGS) handleFedEvent(ctx context.Context, host *models.PDS, env *event
 			if errors.Is(err, carstore.ErrRepoBaseMismatch) || ipld.IsNotFound(err) {
 				ai, lerr := bgs.Index.LookupUser(ctx, u.ID)
 				if lerr != nil {
-					log.Warn("failed handling event, no user", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+					log.Warn("failed handling event, no user", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "commit", evt.Commit.String())
 					repoCommitsResultCounter.WithLabelValues(host.Host, "nou4").Inc()
 					return fmt.Errorf("failed to look up user %s (%d) (err case: %s): %w", u.Did, u.ID, err, lerr)
 				}
 
 				span.SetAttributes(attribute.Bool("catchup_queue", true))
 
-				log.Info("failed handling event, catchup", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+				log.Info("failed handling event, catchup", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "commit", evt.Commit.String())
 				repoCommitsResultCounter.WithLabelValues(host.Host, "catchup2").Inc()
 				return bgs.Index.Crawler.AddToCatchupQueue(ctx, host, ai, evt)
 			}
 
-			log.Warn("failed handling event", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "prev", stringLink(evt.Prev), "commit", evt.Commit.String())
+			log.Warn("failed handling event", "err", err, "pdsHost", host.Host, "seq", evt.Seq, "repo", u.Did, "commit", evt.Commit.String())
 			repoCommitsResultCounter.WithLabelValues(host.Host, "err").Inc()
 			return fmt.Errorf("handle user event failed: %w", err)
 		}

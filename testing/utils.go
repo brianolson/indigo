@@ -25,11 +25,11 @@ import (
 	"github.com/bluesky-social/indigo/bgs"
 	"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/events"
+	"github.com/bluesky-social/indigo/events/diskpersist"
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
 	"github.com/bluesky-social/indigo/indexer"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
-	"github.com/bluesky-social/indigo/notifs"
 	"github.com/bluesky-social/indigo/pds"
 	"github.com/bluesky-social/indigo/plc"
 	"github.com/bluesky-social/indigo/repo"
@@ -210,12 +210,14 @@ func (tp *TestPDS) BumpLimits(t *testing.T, b *TestRelay) {
 	}
 
 	limReqBody := bgs.RateLimitChangeRequest{
-		Host:      u.Host,
-		PerSecond: 5_000,
-		PerHour:   100_000,
-		PerDay:    1_000_000,
-		RepoLimit: 500_000,
-		CrawlRate: 50_000,
+		Host: u.Host,
+		PDSRates: bgs.PDSRates{
+			PerSecond: 5_000,
+			PerHour:   100_000,
+			PerDay:    1_000_000,
+			RepoLimit: 500_000,
+			CrawlRate: 50_000,
+		},
 	}
 
 	// JSON encode the request body
@@ -421,10 +423,10 @@ func (u *TestUser) Like(t *testing.T, post *atproto.RepoStrongRef) {
 
 	ctx := context.TODO()
 	_, err := atproto.RepoCreateRecord(ctx, u.client, &atproto.RepoCreateRecord_Input{
-		Collection: "app.bsky.feed.vote",
+		Collection: "app.bsky.feed.like",
 		Repo:       u.did,
 		Record: &lexutil.LexiconTypeDecoder{Val: &bsky.FeedLike{
-			LexiconTypeID: "app.bsky.feed.vote",
+			LexiconTypeID: "app.bsky.feed.like",
 			CreatedAt:     time.Now().Format(time.RFC3339),
 			Subject:       post,
 		}},
@@ -465,18 +467,6 @@ func (u *TestUser) GetFeed(t *testing.T) []*bsky.FeedDefs_FeedViewPost {
 	}
 
 	return resp.Feed
-}
-
-func (u *TestUser) GetNotifs(t *testing.T) []*bsky.NotificationListNotifications_Notification {
-	t.Helper()
-
-	ctx := context.TODO()
-	resp, err := bsky.NotificationListNotifications(ctx, u.client, "", 100, false, nil, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return resp.Notifications
 }
 
 func (u *TestUser) ChangeHandle(t *testing.T, nhandle string) {
@@ -570,16 +560,14 @@ func SetupRelay(ctx context.Context, didr plc.PLCClient, archive bool) (*TestRel
 
 	repoman := repomgr.NewRepoManager(cs, kmgr)
 
-	notifman := notifs.NewNotificationManager(maindb, repoman.GetRecord)
-
-	opts := events.DefaultDiskPersistOptions()
+	opts := diskpersist.DefaultDiskPersistOptions()
 	opts.EventsPerFile = 10
-	diskpersist, err := events.NewDiskPersistence(filepath.Join(dir, "dp-primary"), filepath.Join(dir, "dp-archive"), maindb, opts)
+	diskpersist, err := diskpersist.NewDiskPersistence(filepath.Join(dir, "dp-primary"), filepath.Join(dir, "dp-archive"), maindb, opts)
 
 	evtman := events.NewEventManager(diskpersist)
 	rf := indexer.NewRepoFetcher(maindb, repoman, 10)
 
-	ix, err := indexer.NewIndexer(maindb, notifman, evtman, didr, rf, true, true, true)
+	ix, err := indexer.NewIndexer(maindb, evtman, didr, rf, true)
 	if err != nil {
 		return nil, err
 	}
@@ -955,7 +943,7 @@ func GenerateFakeRepo(r *repo.Repo, size int) (cid.Cid, error) {
 				return cid.Undef, err
 			}
 		case "like":
-			_, _, err := r.CreateRecord(ctx, "app.bsky.feed.vote", &bsky.FeedLike{
+			_, _, err := r.CreateRecord(ctx, "app.bsky.feed.like", &bsky.FeedLike{
 				CreatedAt: time.Now().Format(bsutil.ISO8601),
 				Subject: &atproto.RepoStrongRef{
 					Uri: RandFakeAtUri("app.bsky.feed.post", ""),

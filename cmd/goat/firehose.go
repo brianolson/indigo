@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -78,8 +79,21 @@ func runFirehose(cctx *cli.Context) error {
 		CollectionFilter: cctx.StringSlice("collection"),
 	}
 
-	relayHost := cctx.String("relay-host")
-	cursor := cctx.Int("cursor")
+	var relayHost string
+	if cctx.IsSet("relay-host") {
+		if cctx.Args().Len() != 0 {
+			return errors.New("error: unused positional args")
+		}
+		relayHost = cctx.String("relay-host")
+	} else {
+		if cctx.Args().Len() == 1 {
+			relayHost = cctx.Args().First()
+		} else if cctx.Args().Len() > 1 {
+			return errors.New("can only have at most one relay-host")
+		} else {
+			relayHost = cctx.String("relay-host")
+		}
+	}
 
 	dialer := websocket.DefaultDialer
 	u, err := url.Parse(relayHost)
@@ -87,10 +101,12 @@ func runFirehose(cctx *cli.Context) error {
 		return fmt.Errorf("invalid relayHost URI: %w", err)
 	}
 	u.Path = "xrpc/com.atproto.sync.subscribeRepos"
-	if cursor != 0 {
-		u.RawQuery = fmt.Sprintf("cursor=%d", cursor)
+	if cctx.IsSet("cursor") {
+		u.RawQuery = fmt.Sprintf("cursor=%d", cctx.Int("cursor"))
 	}
-	con, _, err := dialer.Dial(u.String(), http.Header{
+	urlString := u.String()
+	slog.Debug("GET", "url", urlString)
+	con, _, err := dialer.Dial(urlString, http.Header{
 		"User-Agent": []string{fmt.Sprintf("goat/%s", versioninfo.Short())},
 	})
 	if err != nil {
