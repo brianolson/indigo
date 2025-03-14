@@ -138,22 +138,7 @@ func (cr *Crawler) CrawlPDSRepoCollections() error {
 		slog.Debug("got repo list", "count", len(repos.Repos))
 		for _, xr := range repos.Repos {
 			limiter.Wait(cr.Ctx)
-			desc, err := atproto.RepoDescribeRepo(cr.Ctx, cr.RpcClient, xr.Did)
-			if err != nil {
-				erst := err.Error()
-				if strings.Contains(erst, "RepoDeactivated") || strings.Contains(erst, "RepoTakendown") {
-					slog.Info("repo unavail", "host", cr.RpcClient.Host, "did", xr.Did, "err", err)
-				} else {
-					slog.Warn("repo desc", "host", cr.RpcClient.Host, "did", xr.Did, "err", err)
-				}
-				continue
-			}
-			for _, collection := range desc.Collections {
-				cr.Results <- DidCollection{Did: xr.Did, Collection: collection}
-			}
-			if cr.Stats != nil {
-				cr.Stats.ReposDescribed.Add(1)
-			}
+			cr.CrawlRepo(xr.Did)
 		}
 		if repos.Cursor != nil {
 			cursor = *repos.Cursor
@@ -162,4 +147,23 @@ func (cr *Crawler) CrawlPDSRepoCollections() error {
 		}
 	}
 	return nil
+}
+
+func (cr *Crawler) CrawlRepo(did string) {
+	desc, err := atproto.RepoDescribeRepo(cr.Ctx, cr.RpcClient, did)
+	if err != nil {
+		erst := err.Error()
+		if strings.Contains(erst, "RepoDeactivated") || strings.Contains(erst, "RepoTakendown") {
+			slog.Info("repo unavail", "host", cr.RpcClient.Host, "did", did, "err", err)
+		} else {
+			slog.Warn("repo desc", "host", cr.RpcClient.Host, "did", did, "err", err)
+		}
+		return
+	}
+	for _, collection := range desc.Collections {
+		cr.Results <- DidCollection{Did: did, Collection: collection}
+	}
+	if cr.Stats != nil {
+		cr.Stats.ReposDescribed.Add(1)
+	}
 }

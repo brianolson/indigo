@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -158,8 +159,9 @@ type collectionServer struct {
 }
 
 type activeCrawl struct {
-	start time.Time
-	stats *CrawlStats
+	start       time.Time
+	stats       *CrawlStats
+	pendingDids []string
 }
 
 func (cs *collectionServer) run(cctx *cli.Context) error {
@@ -357,6 +359,8 @@ func (cs *collectionServer) handleFirehose(fhevents <-chan *events.XRPCStreamEve
 			if evt.RepoCommit != nil {
 				firehoseCommits.Inc()
 				cs.handleCommit(evt.RepoCommit)
+			} else if evt.RepoSync != nil {
+				cs.handleSync(evt.RepoSync)
 			}
 		}
 	}
@@ -382,6 +386,10 @@ func (cs *collectionServer) handleCommit(commit *comatproto.SyncSubscribeRepos_C
 			}
 		}
 	}
+}
+func (cs *collectionServer) handleSync(evt *comatproto.SyncSubscribeRepos_Sync) {
+	// TODO: get DID doc from identity service, go to canonical PDS and describeRepo for NSIDs (e.g. crawl this one repo)
+	cs.log.Info("#sync", "did", evt.Did)
 }
 
 func (cs *collectionServer) StartMetricsServer(ctx context.Context, addr string) error {
@@ -414,15 +422,16 @@ func (cs *collectionServer) StartApiServer(ctx context.Context, addr string) err
 	e.GET("/_health", cs.healthz)
 
 	e.GET("/xrpc/com.atproto.sync.listReposByCollection", cs.getDidsForCollection)
+	e.POST("/xrpc/com.atproto.sync.requestCrawl", cs.requestCrawl)
 	e.GET("/v1/getDidsForCollection", cs.getDidsForCollection)
 	e.GET("/v1/listCollections", cs.listCollections)
 
 	// TODO: allow public 'requestCrawl' API?
-	//e.GET("/xrpc/com.atproto.sync.requestCrawl", cs.crawlPds)
-	//e.POST("/xrpc/com.atproto.sync.requestCrawl", cs.crawlPds)
+	//e.GET("/xrpc/com.atproto.sync.requestCrawl", cs.adminRequestCrawl)
+	//e.POST("/xrpc/com.atproto.sync.requestCrawl", cs.adminRequestCrawl)
 
 	// admin auth heador required
-	e.POST("/admin/pds/requestCrawl", cs.crawlPds) // same as relay
+	e.POST("/admin/pds/requestCrawl", cs.adminRequestCrawl) // same as relay
 	e.GET("/admin/crawlStatus", cs.crawlStatus)
 
 	e.Listener = li
@@ -454,6 +463,10 @@ func getLimit(c echo.Context, min, defaultLim, max int) int {
 	return lv
 }
 
+type XRPCError struct {
+	Message string `json:"message"`
+}
+
 // /xrpc/com.atproto.sync.listReposByCollection?collection={}&cursor={}&limit={50<=N<=1000}
 // /v1/getDidsForCollection?collection={}&cursor={}&limit={50<=N<=1000}
 //
@@ -464,14 +477,14 @@ func (cs *collectionServer) getDidsForCollection(c echo.Context) error {
 	collection := c.QueryParam("collection")
 	_, err := syntax.ParseNSID(collection)
 	if err != nil {
-		return c.String(http.StatusBadRequest, fmt.Sprintf("bad collection nsid, %s", err.Error()))
+		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("bad collection nsid, %s", err.Error())})
 	}
 	cursor := c.QueryParam("cursor")
 	limit := getLimit(c, 1, 500, 10_000)
 	they, nextCursor, err := cs.pcd.ReadCollection(ctx, collection, cursor, limit)
 	if err != nil {
 		slog.Error("ReadCollection", "collection", collection, "cursor", cursor, "limit", limit, "err", err)
-		return c.String(http.StatusInternalServerError, "oops")
+		return c.JSON(http.StatusInternalServerError, XRPCError{Message: "oops"})
 	}
 	cs.log.Info("getDidsForCollection", "collection", collection, "cursor", cursor, "limit", limit, "count", len(they), "nextCursor", nextCursor)
 	var out comatproto.SyncListReposByCollection_Output
@@ -839,6 +852,27 @@ func (cs *collectionServer) isAdmin(c echo.Context) bool {
 	return false
 }
 
+// POST /xrpc/com.atproto.sync.requestCrawl
+// Start a backfill crawl to listRepos and describeRepo them all to get NSIDs active in each repo
+func (cs *collectionServer) requestCrawl(c echo.Context) error {
+	var body comatproto.SyncRequestCrawl_Input
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid body: %s", err)})
+	}
+	if body.Hostname == "" {
+		return c.JSON(http.StatusBadRequest, XRPCError{Message: "hostname is required"})
+	}
+	// TODO: check if this is a _new_ PDS, or at least if it hasn't been crawled in 'a long time'
+	// This is a _public_ API and needs limits.
+	// The _admin_ API can just do what we tell it to do.
+	// Probably the public limit should be one crawl per day or so, maybe even per week.
+	// This is also vulnerable to abuse because there's no check that it's coming from anyone with any authority at the PDS.
+	// An adversary could just hit this "crawl all the PDSes" or "crawl that guy's PDS" repeatedly.
+	// TODO: this is deactivated until we have time to build it properly
+	//go cs.crawlThread(body.Hostname, nil)
+	return nil
+}
+
 // /admin/pds/requestCrawl
 // same API signature as relay admin requestCrawl
 // starts a crawl and returns. See /v1/crawlStatus
@@ -847,14 +881,14 @@ func (cs *collectionServer) isAdmin(c echo.Context) bool {
 // POST {"hostname":"one hostname or URL", "hosts":["up to 1000 hosts", "..."]}
 // OR
 // POST /admin/pds/requestCrawl?hostname={one host}
-func (cs *collectionServer) crawlPds(c echo.Context) error {
+func (cs *collectionServer) adminRequestCrawl(c echo.Context) error {
 	isAdmin := cs.isAdmin(c)
 	if !isAdmin {
 		return c.JSON(http.StatusForbidden, CrawlRequestResponse{Error: "nope"})
 	}
 	hostQ := c.QueryParam("host")
 	if hostQ != "" {
-		go cs.crawlThread(hostQ)
+		go cs.crawlThread(hostQ, nil)
 		return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
 	}
 
@@ -865,15 +899,15 @@ func (cs *collectionServer) crawlPds(c echo.Context) error {
 		return c.String(http.StatusBadRequest, err.Error())
 	}
 	if req.Host != "" {
-		go cs.crawlThread(req.Host)
+		go cs.crawlThread(req.Host, nil)
 	}
 	for _, host := range req.Hosts {
-		go cs.crawlThread(host)
+		go cs.crawlThread(host, nil)
 	}
 	return c.JSON(http.StatusOK, CrawlRequestResponse{Message: "ok"})
 }
 
-func (cs *collectionServer) crawlThread(hostIn string) {
+func (cs *collectionServer) crawlThread(hostIn string, dids []string) {
 	host := hostOrUrlToUrl(hostIn)
 	if host != hostIn {
 		cs.log.Info("going to crawl", "in", hostIn, "as", host)
@@ -896,7 +930,7 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 		Log:       cs.log,
 	}
 	start := time.Now()
-	ok, crawlStats := cs.recordCrawlStart(host, start)
+	ok, crawlStats := cs.recordCrawlStart(host, start, dids)
 	if !ok {
 		cs.log.Info("not crawling dup", "host", host)
 		return
@@ -904,7 +938,15 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 	crawler.Stats = crawlStats
 	cs.log.Info("crawling", "host", host)
 	err := crawler.CrawlPDSRepoCollections()
-	cs.clearActiveCrawl(host)
+	for {
+		pendingDids := cs.clearActiveCrawlOrGetPendingDIDs(host)
+		if pendingDids == nil {
+			break
+		}
+		for _, did := range pendingDids {
+			crawler.CrawlRepo(did)
+		}
+	}
 	pdsCrawledCounter.Inc()
 	if err != nil {
 		cs.log.Warn("crawl err", "host", host, "err", err)
@@ -915,14 +957,20 @@ func (cs *collectionServer) crawlThread(hostIn string) {
 }
 
 // recordCrawlStart returns true if ok, false if duplicate
-func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok bool, stats *CrawlStats) {
+// if there already is one, append dids to it
+func (cs *collectionServer) recordCrawlStart(host string, start time.Time, dids []string) (ok bool, stats *CrawlStats) {
 	cs.activeCrawlsLock.Lock()
 	defer cs.activeCrawlsLock.Unlock()
 	if cs.activeCrawls == nil {
 		cs.activeCrawls = make(map[string]activeCrawl)
 	} else {
-		_, dup := cs.activeCrawls[host]
+		active, dup := cs.activeCrawls[host]
 		if dup {
+			for _, did := range dids {
+				if !slices.Contains(active.pendingDids, did) {
+					active.pendingDids = append(active.pendingDids, did)
+				}
+			}
 			return false, nil
 		}
 	}
@@ -934,13 +982,26 @@ func (cs *collectionServer) recordCrawlStart(host string, start time.Time) (ok b
 	return true, stats
 }
 
-func (cs *collectionServer) clearActiveCrawl(host string) {
+// clearActiveCrawlOrGetPendingDIDs will either:
+// * return pending DIDs that were added while the crawl was ongoing; OR
+// * clear the active crawl and return nil
+func (cs *collectionServer) clearActiveCrawlOrGetPendingDIDs(host string) []string {
 	cs.activeCrawlsLock.Lock()
 	defer cs.activeCrawlsLock.Unlock()
 	if cs.activeCrawls == nil {
-		return
+		return nil
+	}
+	active, ok := cs.activeCrawls[host]
+	if !ok {
+		return nil
+	}
+	if len(active.pendingDids) > 0 {
+		out := active.pendingDids
+		active.pendingDids = nil
+		return out
 	}
 	delete(cs.activeCrawls, host)
+	return nil
 }
 
 type CrawlStatusResponse struct {
@@ -971,6 +1032,13 @@ func (cs *collectionServer) crawlStatus(c echo.Context) error {
 	}
 	out.ServerTime = time.Now().UTC().Format(time.RFC3339Nano)
 	return c.JSON(http.StatusOK, out)
+}
+
+// if there is an active crawl, add the did to the pending list for it
+// if there is no active crawl, start one
+func (cs *collectionServer) crawlPDSDid(host, did string) {
+	// start a crawl thread, if it is a dup it will fail fast and append the did list to the active crawl
+	go cs.crawlThread(host, []string{did})
 }
 
 func (cs *collectionServer) healthz(c echo.Context) error {
